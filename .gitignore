@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.pyo
+data/live_state/
 
 # Mac files
 .DS_Store
