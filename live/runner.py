@@ -88,6 +88,10 @@ class LiveRunner:
 
         # Exchange order tracking: exchange_order_id -> internal info
         self.active_orders = {}
+        # Conditional orders (TP/SL) tracked separately — they don't appear
+        # in fetch_open_orders() until triggered, so _sync_exchange_state()
+        # must not treat them as disappeared/filled.
+        self.conditional_orders = {}
 
         # Bar counter and timing
         self.bar_count = 0
@@ -206,6 +210,7 @@ class LiveRunner:
         self.bar_count = saved.get('bar_count', 0)
         self.last_processed_bar_ts = saved.get('last_processed_bar_ts', 0)
         self.active_orders = saved.get('active_orders', {})
+        self.conditional_orders = saved.get('conditional_orders', {})
         self.metrics = saved.get('metrics', self.metrics)
 
         # Restore position fills
@@ -248,6 +253,18 @@ class LiveRunner:
 
                 # 4. Sync with exchange (detect fills)
                 self._sync_exchange_state()
+
+                # 4b. Refresh wallet balance from exchange
+                # (picks up fills, funding, fees applied by Binance)
+                try:
+                    balance = self.executor.get_balance()
+                    ex_balance = balance.get('total', self.wallet_balance)
+                    if abs(ex_balance - self.wallet_balance) > 0.01:
+                        logger.info(f"Wallet balance synced: "
+                                    f"${self.wallet_balance:.2f} → ${ex_balance:.2f}")
+                        self.wallet_balance = ex_balance
+                except Exception as e:
+                    logger.warning(f"Balance refresh failed: {e}")
 
                 # 5. Execute strategy step
                 self._execute_strategy_step(indicators)
@@ -595,6 +612,7 @@ class LiveRunner:
                 self.metrics['circuit_breaker_triggers'] += 1
                 self.executor.cancel_all_orders(self.symbol)
                 self.active_orders.clear()
+                self.conditional_orders.clear()
                 self.trade_logger.log_event(
                     'CIRCUIT_BREAKER',
                     f'Z-Score: {prev_z:.2f} < {halt_z}. All orders cancelled.')
@@ -749,6 +767,7 @@ class LiveRunner:
                 logger.error("Failed to cancel orders, skipping grid regeneration")
                 return
             self.active_orders.clear()
+            self.conditional_orders.clear()
             time.sleep(0.5)  # Brief pause for cancel to propagate
 
             # Check for fills during cancel
@@ -763,22 +782,75 @@ class LiveRunner:
                 cur_time, grid_levels, spacing_k, spacing_floor,
                 gamma, kappa, order_pct, leverage, max_inv_per_side,
                 max_position_pct, allow_short, long_bias, short_bias)
+
+            # ─── 8b. EXCHANGE-SIDE STOP LOSS (STOP_MARKET) ─────
+            # Places STOP_MARKET orders on Binance so stops execute
+            # in real-time between candles, not just at 15m checks.
+            # The candle-based stop (step 3) remains as a backup.
+            if self.pos_long.is_open:
+                sl_price = self.pos_long.avg_entry - atr_sl_mult * prev_atr
+                if sl_price > 0:
+                    sl_order = self.executor.place_stop_loss(
+                        self.symbol, 'sell', self.pos_long.size,
+                        sl_price, 'LONG',
+                        client_order_id=f'sl_L_{int(cur_time)}')
+                    if sl_order:
+                        self.conditional_orders[str(sl_order['id'])] = {
+                            'side': 'sell', 'price': sl_price,
+                            'qty': float(sl_order.get('amount', self.pos_long.size)),
+                            'direction': DIR_LONG, 'reduce_only': True,
+                            'position_side': 'LONG',
+                            'placed_at': int(cur_time),
+                            'order_type': 'STOP_MARKET',
+                        }
+
+            if self.pos_short.is_open and allow_short:
+                sl_price = self.pos_short.avg_entry + atr_sl_mult * prev_atr
+                sl_order = self.executor.place_stop_loss(
+                    self.symbol, 'buy', self.pos_short.size,
+                    sl_price, 'SHORT',
+                    client_order_id=f'sl_S_{int(cur_time)}')
+                if sl_order:
+                    self.conditional_orders[str(sl_order['id'])] = {
+                        'side': 'buy', 'price': sl_price,
+                        'qty': float(sl_order.get('amount', self.pos_short.size)),
+                        'direction': DIR_SHORT, 'reduce_only': True,
+                        'position_side': 'SHORT',
+                        'placed_at': int(cur_time),
+                        'order_type': 'STOP_MARKET',
+                    }
+
             self.grid_needs_regen = False
 
         # ─── 10. FUNDING RATE ────────────────────────────────
+        # In live trading, Binance applies funding to wallet automatically.
+        # We only track it internally for metrics and pruning (funding_cost
+        # per fill) but do NOT adjust wallet_balance — that would double-count.
+        # Instead, refresh wallet_balance from exchange after funding.
         if is_funding_interval(self.bar_count):
             real_rate = self.executor.get_funding_rate(self.symbol)
             if self.pos_long.is_open:
                 f_pnl = apply_funding(self.pos_long.size, cur_close, real_rate, 1)
                 self.pos_long.add_funding(f_pnl)
-                self.wallet_balance += f_pnl
                 self.metrics['funding_pnl'] += f_pnl
 
             if self.pos_short.is_open:
                 f_pnl = apply_funding(self.pos_short.size, cur_close, real_rate, -1)
                 self.pos_short.add_funding(f_pnl)
-                self.wallet_balance += f_pnl
                 self.metrics['funding_pnl'] += f_pnl
+
+            # Refresh wallet balance from exchange to pick up funding
+            # and stay in sync with Binance's actual balance
+            try:
+                balance = self.executor.get_balance()
+                ex_balance = balance.get('total', self.wallet_balance)
+                if abs(ex_balance - self.wallet_balance) > 0.01:
+                    logger.info(f"Wallet balance synced: "
+                                f"${self.wallet_balance:.2f} → ${ex_balance:.2f} "
+                                f"(diff: ${ex_balance - self.wallet_balance:+.2f})")
+                    self.wallet_balance = ex_balance
+            except Exception as e:
+                logger.warning(f"Failed to refresh balance from exchange: {e}")
 
         # ─── 11. LOG EQUITY ──────────────────────────────────
         self._update_equity(cur_close)
@@ -802,7 +874,7 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp, sell_sp, anchor_long = get_skewed_grid_params(
             price, inv_q_long, gamma, vol, kappa,
-            spacing_floor * price, base_spacing)
+            base_spacing * spacing_floor, base_spacing)
 
         self.grid_anchor_long = anchor_long
         buy_levels, sell_levels = generate_grid_levels(
@@ -825,31 +897,37 @@ class LiveRunner:
                     reduce_only=False,
                     client_order_id=f'grid_L_BUY_{lvl_i}_{int(timestamp)}')
                 if order:
+                    actual_qty = float(order.get('amount', qty))
                     self.active_orders[str(order['id'])] = {
-                        'side': 'buy', 'price': lvl_price, 'qty': qty,
+                        'side': 'buy', 'price': lvl_price, 'qty': actual_qty,
                         'direction': DIR_LONG, 'reduce_only': False,
                         'grid_level': lvl_i, 'position_side': 'LONG',
                         'placed_at': int(timestamp),
                     }
                     long_orders += 1
 
-        # Place long sell TPs
+        # Place long TPs as TAKE_PROFIT_MARKET conditional orders
         if self.pos_long.is_open:
-            tp_qty = self.pos_long.size / max(grid_levels, 1)
+            remaining_long = self.pos_long.size
             for lvl_i, lvl_price in enumerate(sell_levels):
+                tp_qty = min(
+                    calculate_order_qty(self.wallet_balance, lvl_price, order_pct, leverage),
+                    remaining_long)
                 if tp_qty < 1e-12:
                     break
-                order = self.executor.place_limit_order(
+                order = self.executor.place_take_profit(
                     self.symbol, 'sell', tp_qty, lvl_price, 'LONG',
-                    reduce_only=True,
                     client_order_id=f'grid_L_TP_{lvl_i}_{int(timestamp)}')
                 if order:
-                    self.active_orders[str(order['id'])] = {
-                        'side': 'sell', 'price': lvl_price, 'qty': tp_qty,
+                    actual_qty = float(order.get('amount', tp_qty))
+                    self.conditional_orders[str(order['id'])] = {
+                        'side': 'sell', 'price': lvl_price, 'qty': actual_qty,
                         'direction': DIR_LONG, 'reduce_only': True,
                         'grid_level': lvl_i, 'position_side': 'LONG',
                         'placed_at': int(timestamp),
+                        'order_type': 'TAKE_PROFIT_MARKET',
                     }
+                    remaining_long -= actual_qty
                     long_orders += 1
 
         if long_orders > 0:
@@ -869,7 +947,7 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp_s, sell_sp_s, anchor_short = get_skewed_grid_params(
             price, inv_q_short, gamma, vol, kappa,
-            spacing_floor * price, base_spacing)
+            base_spacing * spacing_floor, base_spacing)
 
         self.grid_anchor_short = anchor_short
         buy_levels_s, sell_levels_s = generate_grid_levels(
@@ -892,31 +970,39 @@ class LiveRunner:
                     reduce_only=False,
                     client_order_id=f'grid_S_SELL_{lvl_i}_{int(timestamp)}')
                 if order:
+                    actual_qty = float(order.get('amount', qty))
                     self.active_orders[str(order['id'])] = {
-                        'side': 'sell', 'price': lvl_price, 'qty': qty,
+                        'side': 'sell', 'price': lvl_price, 'qty': actual_qty,
                         'direction': DIR_SHORT, 'reduce_only': False,
                         'grid_level': lvl_i, 'position_side': 'SHORT',
                         'placed_at': int(timestamp),
                     }
                     short_orders += 1
 
-        # Short buy TPs
+        # Short TPs as TAKE_PROFIT_MARKET conditional orders
         if self.pos_short.is_open:
-            tp_qty = self.pos_short.size / max(grid_levels, 1)
+            remaining_short = self.pos_short.size
             for lvl_i, lvl_price in enumerate(buy_levels_s):
-                if tp_qty < 1e-12 or lvl_price <= 0:
+                if lvl_price <= 0:
                     break
-                order = self.executor.place_limit_order(
+                tp_qty = min(
+                    calculate_order_qty(self.wallet_balance, lvl_price, order_pct, leverage),
+                    remaining_short)
+                if tp_qty < 1e-12:
+                    break
+                order = self.executor.place_take_profit(
                     self.symbol, 'buy', tp_qty, lvl_price, 'SHORT',
-                    reduce_only=True,
                     client_order_id=f'grid_S_TP_{lvl_i}_{int(timestamp)}')
                 if order:
-                    self.active_orders[str(order['id'])] = {
-                        'side': 'buy', 'price': lvl_price, 'qty': tp_qty,
+                    actual_qty = float(order.get('amount', tp_qty))
+                    self.conditional_orders[str(order['id'])] = {
+                        'side': 'buy', 'price': lvl_price, 'qty': actual_qty,
                         'direction': DIR_SHORT, 'reduce_only': True,
                         'grid_level': lvl_i, 'position_side': 'SHORT',
                         'placed_at': int(timestamp),
+                        'order_type': 'TAKE_PROFIT_MARKET',
                     }
+                    remaining_short -= actual_qty
                     short_orders += 1
 
         if short_orders > 0:
@@ -1008,6 +1094,7 @@ class LiveRunner:
             'bar_count': self.bar_count,
             'last_processed_bar_ts': self.last_processed_bar_ts,
             'active_orders': self.active_orders,
+            'conditional_orders': self.conditional_orders,
             'metrics': self.metrics,
         }
 
@@ -1023,6 +1110,7 @@ class LiveRunner:
         # Cancel all open orders
         self.executor.cancel_all_orders(self.symbol)
         self.active_orders.clear()
+        self.conditional_orders.clear()
 
         # Save final state
         self.state.save(self._serialize_state())
@@ -1045,6 +1133,7 @@ class LiveRunner:
         # Cancel orders
         self.executor.cancel_all_orders(self.symbol)
         self.active_orders.clear()
+        self.conditional_orders.clear()
 
         # Get current price for PnL calculation
         ticker = self.executor.get_ticker(self.symbol)

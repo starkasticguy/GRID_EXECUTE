@@ -218,14 +218,103 @@ class BinanceExecutor:
             return order
         return self._retry(_place)
 
+    def place_take_profit(self, symbol: str, side: str, amount: float,
+                          trigger_price: float, position_side: str,
+                          client_order_id: str = None) -> Optional[dict]:
+        """Place a TAKE_PROFIT_MARKET conditional order in hedge mode.
+
+        Executes as a market order when price reaches trigger_price.
+        Uses Binance Algo Order API (ccxt routes automatically for v4.5.25+).
+        """
+        amount = self._amount_precision(symbol, amount)
+        trigger_price = self._price_precision(symbol, trigger_price)
+
+        if amount <= 0 or trigger_price <= 0:
+            logger.warning(f"Invalid TP params: amount={amount}, trigger={trigger_price}")
+            return None
+
+        if self.dry_run:
+            return self._dry_run_order(symbol, 'TAKE_PROFIT_MARKET', side,
+                                       amount, trigger_price, position_side,
+                                       True, client_order_id)
+
+        def _place():
+            params = {
+                'positionSide': position_side,
+                'triggerPrice': trigger_price,
+            }
+            if client_order_id:
+                params['clientOrderId'] = client_order_id
+            order = self.exchange.create_order(
+                symbol, 'TAKE_PROFIT_MARKET', side, amount, None, params)
+            logger.info(
+                f"TP_MARKET {side.upper()} {amount} {symbol} "
+                f"trigger@{trigger_price} [{position_side}] → id={order['id']}")
+            return order
+        return self._retry(_place)
+
+    def place_stop_loss(self, symbol: str, side: str, amount: float,
+                        trigger_price: float, position_side: str,
+                        client_order_id: str = None) -> Optional[dict]:
+        """Place a STOP_MARKET conditional order in hedge mode.
+
+        Executes as a market order when price reaches trigger_price.
+        Uses Binance Algo Order API (ccxt routes automatically for v4.5.25+).
+        """
+        amount = self._amount_precision(symbol, amount)
+        trigger_price = self._price_precision(symbol, trigger_price)
+
+        if amount <= 0 or trigger_price <= 0:
+            logger.warning(f"Invalid SL params: amount={amount}, trigger={trigger_price}")
+            return None
+
+        if self.dry_run:
+            return self._dry_run_order(symbol, 'STOP_MARKET', side,
+                                       amount, trigger_price, position_side,
+                                       True, client_order_id)
+
+        def _place():
+            params = {
+                'positionSide': position_side,
+                'triggerPrice': trigger_price,
+            }
+            if client_order_id:
+                params['clientOrderId'] = client_order_id
+            order = self.exchange.create_order(
+                symbol, 'STOP_MARKET', side, amount, None, params)
+            logger.info(
+                f"STOP_MARKET {side.upper()} {amount} {symbol} "
+                f"trigger@{trigger_price} [{position_side}] → id={order['id']}")
+            return order
+        return self._retry(_place)
+
     def cancel_all_orders(self, symbol: str) -> int:
-        """Cancel all open orders for a symbol. Returns count cancelled."""
+        """Cancel all open orders for a symbol, including conditional (TP/SL).
+        Returns 0 on success, -1 on failure."""
         if self.dry_run:
             logger.info(f"[DRY-RUN] Would cancel all orders for {symbol}")
             return 0
 
         try:
+            # Cancel regular limit orders
             self.exchange.cancel_all_orders(symbol)
+
+            # Also cancel conditional/algo orders (STOP_MARKET, TAKE_PROFIT_MARKET)
+            # These may be on a separate endpoint on Binance Futures
+            try:
+                open_orders = self.exchange.fetch_open_orders(symbol)
+                for o in open_orders:
+                    otype = (o.get('type') or '').upper()
+                    if otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET',
+                                 'STOP', 'TAKE_PROFIT'):
+                        try:
+                            self.exchange.cancel_order(o['id'], symbol)
+                            logger.info(f"Cancelled conditional order {o['id']} ({otype})")
+                        except Exception:
+                            pass  # Best-effort
+            except Exception:
+                pass  # If we can't fetch, the first cancel_all likely got them
+
             orders = self.get_open_orders(symbol)
             remaining = len(orders)
             logger.info(f"Cancelled all orders for {symbol} ({remaining} remaining)")

@@ -57,7 +57,7 @@ STRATEGY_PARAMS = {
     'fee_maker': -0.00005,          # -0.005% maker rebate
     'fee_taker': 0.0002,            # 0.02% taker fee
     'slippage': 0.0005,             # 0.05% per side
-    'leverage': 2.0,                # 1x default (spot-equivalent)
+    'leverage': 5.0,                # 1x default (spot-equivalent)
     'allow_short': True,            # Enable short grid
 }
 

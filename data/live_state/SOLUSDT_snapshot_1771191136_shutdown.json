@@ -1,8 +1,8 @@
 {
   "version": "v4.0",
   "symbol": "SOL/USDT:USDT",
-  "timestamp": 1771191136066,
-  "datetime": "2026-02-15T21:32:16.066777+00:00",
+  "timestamp": 1771191136069,
+  "datetime": "2026-02-15T21:32:16.069913+00:00",
   "wallet_balance": 100.21784328,
   "initial_capital": 85.03188204,
   "pos_long": {
@@ -48,6 +48,5 @@
     "funding_pnl": 0.0,
     "var_blocks": 0,
     "liquidations": 0
-  },
-  "_saved_at": "2026-02-15T21:32:16.066955+00:00"
+  }
 }

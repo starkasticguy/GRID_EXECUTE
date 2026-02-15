@@ -545,3 +545,183 @@ class TestIndicatorBuffer:
         assert np.array_equal(
             regime_full[-20:], regime_buf[-20:]), \
             "Regime should match for recent bars"
+
+
+# ─── Take Profit / Stop Loss Dry-Run Tests ───────────────────────
+
+class TestConditionalOrdersDryRun:
+
+    @pytest.fixture
+    def dry_executor(self):
+        """Create a dry-run executor (no real exchange connection needed)."""
+        config = LIVE_CONFIG.copy()
+        config['max_retry_attempts'] = 1
+        return BinanceExecutor(
+            'test_key', 'test_secret', config,
+            dry_run=True, testnet=False)
+
+    def test_dry_run_take_profit_order(self, dry_executor):
+        """Dry-run TP order returns synthetic order with correct type."""
+        order = dry_executor.place_take_profit(
+            'BTC/USDT:USDT', 'sell', 0.01, 44000.0, 'LONG')
+
+        assert order is not None
+        assert order['id'].startswith('DRY_')
+        assert order['side'] == 'sell'
+        assert order['amount'] == 0.01
+        assert order['price'] == 44000.0
+        assert order['type'] == 'TAKE_PROFIT_MARKET'
+
+    def test_dry_run_stop_loss_order(self, dry_executor):
+        """Dry-run SL order returns synthetic order with correct type."""
+        order = dry_executor.place_stop_loss(
+            'BTC/USDT:USDT', 'sell', 0.05, 42000.0, 'LONG')
+
+        assert order is not None
+        assert order['id'].startswith('DRY_')
+        assert order['side'] == 'sell'
+        assert order['amount'] == 0.05
+        assert order['price'] == 42000.0
+        assert order['type'] == 'STOP_MARKET'
+
+    def test_dry_run_tp_short_side(self, dry_executor):
+        """Dry-run TP for short side uses buy + SHORT."""
+        order = dry_executor.place_take_profit(
+            'SOL/USDT:USDT', 'buy', 1.0, 80.0, 'SHORT')
+
+        assert order is not None
+        assert order['side'] == 'buy'
+        assert order['info']['positionSide'] == 'SHORT'
+        assert order['type'] == 'TAKE_PROFIT_MARKET'
+
+    def test_dry_run_sl_short_side(self, dry_executor):
+        """Dry-run SL for short side uses buy + SHORT."""
+        order = dry_executor.place_stop_loss(
+            'SOL/USDT:USDT', 'buy', 1.0, 95.0, 'SHORT')
+
+        assert order is not None
+        assert order['side'] == 'buy'
+        assert order['info']['positionSide'] == 'SHORT'
+        assert order['type'] == 'STOP_MARKET'
+
+    def test_tp_invalid_amount_returns_none(self, dry_executor):
+        """TP with zero amount returns None."""
+        order = dry_executor.place_take_profit(
+            'BTC/USDT:USDT', 'sell', 0.0, 44000.0, 'LONG')
+        assert order is None
+
+    def test_sl_invalid_trigger_returns_none(self, dry_executor):
+        """SL with zero trigger price returns None."""
+        order = dry_executor.place_stop_loss(
+            'BTC/USDT:USDT', 'sell', 0.01, 0.0, 'LONG')
+        assert order is None
+
+    def test_tp_with_client_order_id(self, dry_executor):
+        """TP order accepts client_order_id."""
+        order = dry_executor.place_take_profit(
+            'BTC/USDT:USDT', 'sell', 0.01, 44000.0, 'LONG',
+            client_order_id='grid_L_TP_0_12345')
+        assert order is not None
+        assert order['id'].startswith('DRY_')
+
+    def test_sl_with_client_order_id(self, dry_executor):
+        """SL order accepts client_order_id."""
+        order = dry_executor.place_stop_loss(
+            'BTC/USDT:USDT', 'sell', 0.01, 42000.0, 'LONG',
+            client_order_id='sl_L_12345')
+        assert order is not None
+        assert order['id'].startswith('DRY_')
+
+    def test_tp_and_sl_unique_ids(self, dry_executor):
+        """TP and SL orders get unique IDs from the same counter."""
+        ids = set()
+        ids.add(dry_executor.place_take_profit(
+            'BTC/USDT:USDT', 'sell', 0.01, 44000.0, 'LONG')['id'])
+        ids.add(dry_executor.place_stop_loss(
+            'BTC/USDT:USDT', 'sell', 0.01, 42000.0, 'LONG')['id'])
+        ids.add(dry_executor.place_limit_order(
+            'BTC/USDT:USDT', 'buy', 0.01, 43000.0, 'LONG')['id'])
+        assert len(ids) == 3
+
+
+# ─── Conditional Orders State Persistence ─────────────────────────
+
+class TestConditionalOrdersState:
+
+    def test_conditional_orders_in_state_dict(self, tmp_dir):
+        """conditional_orders included in state serialization round-trip."""
+        state = {
+            'version': 'v4.0',
+            'symbol': 'BTCUSDT',
+            'timestamp': int(time.time() * 1000),
+            'wallet_balance': 10000.0,
+            'initial_capital': 10000.0,
+            'pos_long': {'size': 0, 'avg_entry': 0, 'realized_pnl': 0,
+                         'unrealized_pnl': 0, 'funding_pnl': 0,
+                         'num_fills': 0, 'fills': []},
+            'pos_short': {'size': 0, 'avg_entry': 0, 'realized_pnl': 0,
+                          'unrealized_pnl': 0, 'funding_pnl': 0,
+                          'num_fills': 0, 'fills': []},
+            'halted': False,
+            'grid_anchor_long': 43000.0,
+            'grid_anchor_short': 43000.0,
+            'trailing_anchor': 43000.0,
+            'grid_needs_regen': False,
+            'accumulated_profit_long': 0.0,
+            'accumulated_profit_short': 0.0,
+            'bar_count': 10,
+            'last_processed_bar_ts': int(time.time() * 1000),
+            'active_orders': {},
+            'conditional_orders': {
+                'tp_order_1': {
+                    'side': 'sell', 'price': 44000.0, 'qty': 0.01,
+                    'direction': 1, 'reduce_only': True,
+                    'position_side': 'LONG', 'placed_at': 1000000,
+                    'order_type': 'TAKE_PROFIT_MARKET',
+                },
+                'sl_order_1': {
+                    'side': 'sell', 'price': 42000.0, 'qty': 0.05,
+                    'direction': 1, 'reduce_only': True,
+                    'position_side': 'LONG', 'placed_at': 1000000,
+                    'order_type': 'STOP_MARKET',
+                },
+            },
+            'metrics': {
+                'longs_opened': 0, 'longs_closed': 0,
+                'shorts_opened': 0, 'shorts_closed': 0,
+                'stops_long': 0, 'stops_short': 0,
+                'prune_count': 0, 'prune_types': {},
+                'circuit_breaker_triggers': 0, 'trailing_shifts': 0,
+                'funding_pnl': 0.0, 'var_blocks': 0, 'liquidations': 0,
+            },
+        }
+
+        mgr = StateManager(tmp_dir, 'BTCUSDT')
+        mgr.save(state)
+        loaded = mgr.load()
+
+        assert loaded is not None
+        assert 'conditional_orders' in loaded
+        assert len(loaded['conditional_orders']) == 2
+        assert loaded['conditional_orders']['tp_order_1']['order_type'] == 'TAKE_PROFIT_MARKET'
+        assert loaded['conditional_orders']['sl_order_1']['order_type'] == 'STOP_MARKET'
+        assert loaded['conditional_orders']['tp_order_1']['qty'] == 0.01
+        assert loaded['conditional_orders']['sl_order_1']['price'] == 42000.0
+
+    def test_empty_conditional_orders_backward_compat(self, tmp_dir):
+        """State without conditional_orders field loads with empty dict."""
+        # Simulates old state files without the new field
+        state = {
+            'version': 'v4.0',
+            'wallet_balance': 10000.0,
+            'active_orders': {},
+            'metrics': {},
+        }
+        mgr = StateManager(tmp_dir, 'BTCUSDT')
+        mgr.save(state)
+        loaded = mgr.load()
+
+        assert loaded is not None
+        # The loaded state won't have 'conditional_orders' key,
+        # but _restore_state() uses .get() with default {}
+        assert loaded.get('conditional_orders', {}) == {}
