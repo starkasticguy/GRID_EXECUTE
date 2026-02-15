@@ -1,0 +1,1087 @@
+"""
+LiveRunner — Main live execution orchestrator.
+
+Replicates the 11-step backtest loop (engine/strategy.py) but operates
+on real-time 15m candle data and synchronizes with Binance exchange state.
+
+Key differences from backtest:
+  - Indicators computed on a rolling buffer (not full dataset)
+  - Fills detected via exchange order polling (not virtual OrderBook)
+  - Orders placed via BinanceExecutor (not virtual OrderBook)
+  - Real funding rates (not synthetic)
+  - State persisted to disk after every bar
+"""
+import time
+import logging
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+
+from core.kama import (
+    calculate_er, calculate_kama, detect_regime,
+    REGIME_NOISE, REGIME_UPTREND, REGIME_DOWNTREND,
+    REGIME_BREAKOUT_UP, REGIME_BREAKOUT_DOWN, REGIME_NAMES,
+)
+from core.atr import calculate_atr, calculate_z_score, calculate_rolling_volatility
+from core.grid import generate_grid_levels, calculate_order_qty, calculate_dynamic_spacing
+from core.inventory import get_skewed_grid_params, normalize_inventory
+from core.risk import check_var_constraint, calculate_liquidation_price
+from core.funding import apply_funding, should_bias_for_funding, is_funding_interval
+from engine.types import (
+    PositionTracker, SIDE_BUY, SIDE_SELL, DIR_LONG, DIR_SHORT,
+    LABEL_BUY_OPEN_LONG, LABEL_SELL_CLOSE_LONG,
+    LABEL_SELL_OPEN_SHORT, LABEL_BUY_CLOSE_SHORT,
+    LABEL_STOP_LONG, LABEL_STOP_SHORT,
+    LABEL_CIRCUIT_BREAKER, LABEL_LIQUIDATION,
+)
+from engine.pruning import run_pruning_cycle
+from live.executor import BinanceExecutor
+from live.state import StateManager
+from live.logger import TradeLogger
+from live.monitor import HealthMonitor
+
+logger = logging.getLogger('live_runner')
+
+
+class LiveRunner:
+
+    def __init__(self, executor: BinanceExecutor, symbol: str,
+                 strategy_config: dict, live_config: dict,
+                 state_manager: StateManager, trade_logger: TradeLogger,
+                 health_monitor: HealthMonitor):
+        self.executor = executor
+        self.symbol = symbol
+        self.config = strategy_config
+        self.live_config = live_config
+        self.state = state_manager
+        self.trade_logger = trade_logger
+        self.monitor = health_monitor
+
+        # Core state (mirrors backtest GridStrategyV4)
+        self.initial_capital = strategy_config['initial_capital']
+        self.wallet_balance = 0.0
+        self.pos_long = PositionTracker(side=1)
+        self.pos_short = PositionTracker(side=-1)
+        self.halted = False
+        self.grid_needs_regen = True
+        self.grid_anchor_long = 0.0
+        self.grid_anchor_short = 0.0
+        self.trailing_anchor = 0.0
+
+        # Accumulated profit for offset pruning
+        self.accumulated_profit_long = 0.0
+        self.accumulated_profit_short = 0.0
+
+        # Metrics (same schema as backtest)
+        self.metrics = {
+            'longs_opened': 0, 'longs_closed': 0,
+            'shorts_opened': 0, 'shorts_closed': 0,
+            'stops_long': 0, 'stops_short': 0,
+            'prune_count': 0, 'prune_types': {},
+            'circuit_breaker_triggers': 0, 'trailing_shifts': 0,
+            'funding_pnl': 0.0, 'var_blocks': 0, 'liquidations': 0,
+        }
+
+        # Rolling candle buffer
+        self.candle_buffer = None  # pd.DataFrame
+        self.buffer_size = live_config.get('buffer_size', 200)
+
+        # Exchange order tracking: exchange_order_id -> internal info
+        self.active_orders = {}
+
+        # Bar counter and timing
+        self.bar_count = 0
+        self.last_processed_bar_ts = 0
+        self._last_regime = 0  # Cached regime from last indicator computation
+
+        # Shutdown flag
+        self._running = False
+        self._session_start = None
+
+    # ─── Initialization ──────────────────────────────────────────
+
+    def initialize(self, resume: bool = False) -> bool:
+        """Initialize runner state from exchange + persisted state."""
+        try:
+            # 1. Fetch wallet balance
+            balance = self.executor.get_balance()
+            self.wallet_balance = balance['total']
+            if self.wallet_balance < 1:
+                logger.error(f"Wallet balance too low: ${self.wallet_balance:.2f}")
+                return False
+            logger.info(f"Wallet balance: ${self.wallet_balance:,.2f}")
+
+            # 2. Try to restore from saved state
+            if resume:
+                saved = self.state.load()
+                if saved:
+                    self._restore_state(saved)
+                    logger.info("State restored from disk")
+                else:
+                    logger.info("No saved state found, starting fresh")
+
+            # 3. Warm up candle buffer
+            self._warm_up_candle_buffer()
+            if self.candle_buffer is None or len(self.candle_buffer) < 30:
+                logger.error("Insufficient candle data for indicator warm-up")
+                return False
+            logger.info(f"Candle buffer warmed: {len(self.candle_buffer)} bars")
+
+            # 4. Set initial anchors from current price
+            last_close = self.candle_buffer['close'].iloc[-1]
+            if self.grid_anchor_long == 0:
+                self.grid_anchor_long = last_close
+            if self.grid_anchor_short == 0:
+                self.grid_anchor_short = last_close
+            if self.trailing_anchor == 0:
+                self.trailing_anchor = last_close
+
+            # 5. Sync with exchange positions
+            self._sync_positions_from_exchange()
+
+            self._session_start = datetime.now(timezone.utc)
+            logger.info("LiveRunner initialized successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Initialization failed: {e}", exc_info=True)
+            return False
+
+    def _warm_up_candle_buffer(self):
+        """Fetch historical candles for indicator warm-up."""
+        timeframe = self.live_config.get('timeframe', '15m')
+        candles = self.executor.get_latest_candles(
+            self.symbol, timeframe, limit=self.buffer_size)
+
+        if not candles:
+            logger.error("Failed to fetch historical candles")
+            return
+
+        # Drop the last candle if it's still open (incomplete)
+        # The last candle from fetch_ohlcv is usually the current (open) bar
+        if len(candles) > 1:
+            candles = candles[:-1]
+
+        df = pd.DataFrame(candles,
+                          columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = df.astype({'timestamp': 'int64', 'open': 'float64', 'high': 'float64',
+                        'low': 'float64', 'close': 'float64', 'volume': 'float64'})
+        self.candle_buffer = df
+        if len(df) > 0:
+            self.last_processed_bar_ts = int(df['timestamp'].iloc[-1])
+
+    def _sync_positions_from_exchange(self):
+        """Sync internal position trackers with exchange reality."""
+        positions = self.executor.get_positions(self.symbol)
+
+        ex_long = positions['long']
+        ex_short = positions['short']
+
+        # If we have no fills tracked but exchange shows a position,
+        # create a synthetic fill to match
+        if ex_long['size'] > 1e-8 and not self.pos_long.is_open:
+            logger.info(f"Syncing exchange LONG position: "
+                        f"{ex_long['size']} @ {ex_long['avg_entry']}")
+            self.pos_long.add_fill(
+                ex_long['avg_entry'], ex_long['size'],
+                time.time() * 1000, 0)
+
+        if ex_short['size'] > 1e-8 and not self.pos_short.is_open:
+            logger.info(f"Syncing exchange SHORT position: "
+                        f"{ex_short['size']} @ {ex_short['avg_entry']}")
+            self.pos_short.add_fill(
+                ex_short['avg_entry'], ex_short['size'],
+                time.time() * 1000, 0)
+
+    def _restore_state(self, saved: dict):
+        """Restore runner state from a saved state dict."""
+        self.wallet_balance = saved.get('wallet_balance', self.wallet_balance)
+        self.halted = saved.get('halted', False)
+        self.grid_anchor_long = saved.get('grid_anchor_long', 0.0)
+        self.grid_anchor_short = saved.get('grid_anchor_short', 0.0)
+        self.trailing_anchor = saved.get('trailing_anchor', 0.0)
+        self.grid_needs_regen = saved.get('grid_needs_regen', True)
+        self.accumulated_profit_long = saved.get('accumulated_profit_long', 0.0)
+        self.accumulated_profit_short = saved.get('accumulated_profit_short', 0.0)
+        self.bar_count = saved.get('bar_count', 0)
+        self.last_processed_bar_ts = saved.get('last_processed_bar_ts', 0)
+        self.active_orders = saved.get('active_orders', {})
+        self.metrics = saved.get('metrics', self.metrics)
+
+        # Restore position fills
+        for side_key, tracker in [('pos_long', self.pos_long),
+                                   ('pos_short', self.pos_short)]:
+            pos_data = saved.get(side_key, {})
+            fills = pos_data.get('fills', [])
+            for fill in fills:
+                tracker.add_fill(
+                    fill['price'], fill['qty'],
+                    fill.get('timestamp', 0),
+                    0)
+                if fill.get('funding_cost', 0) > 0:
+                    # Restore funding cost per fill
+                    if tracker.fills:
+                        tracker.fills[-1]['funding_cost'] = fill['funding_cost']
+
+    # ─── Main Loop ───────────────────────────────────────────────
+
+    def run(self):
+        """Main execution loop. Runs until shutdown signal."""
+        self._running = True
+        logger.info(f"LiveRunner started for {self.symbol}")
+
+        while self._running:
+            try:
+                # 1. Wait for new bar
+                new_candle = self._wait_for_new_candle()
+                if new_candle is None:
+                    continue
+
+                # 2. Append to buffer
+                self._append_candle(new_candle)
+
+                # 3. Recompute indicators
+                indicators = self._compute_indicators()
+                if indicators is None:
+                    logger.warning("Indicator computation failed, skipping bar")
+                    continue
+
+                # 4. Sync with exchange (detect fills)
+                self._sync_exchange_state()
+
+                # 5. Execute strategy step
+                self._execute_strategy_step(indicators)
+
+                # 6. Save state
+                self.state.save(self._serialize_state())
+                self.state.cleanup_old_snapshots()
+
+                # 7. Health check
+                self.monitor.heartbeat()
+                self.monitor.check_position_sync(
+                    self.executor, self.symbol,
+                    self.pos_long, self.pos_short)
+
+                # Equity check
+                cur_price = indicators['close'][-1]
+                total_equity = self._total_equity(cur_price)
+                eq_status = self.monitor.check_equity(total_equity)
+                if eq_status == 'critical':
+                    logger.critical("Emergency equity threshold breached!")
+                    self.emergency_shutdown()
+                    break
+
+                self.bar_count += 1
+
+            except KeyboardInterrupt:
+                logger.info("KeyboardInterrupt — shutting down")
+                self.shutdown()
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}", exc_info=True)
+                should_stop = self.monitor.report_error(e)
+                if should_stop:
+                    logger.critical("Too many consecutive errors — shutting down")
+                    self.shutdown()
+                    break
+                time.sleep(30)
+
+    def _wait_for_new_candle(self):
+        """Wait for the next completed 15m candle."""
+        timeframe_ms = 15 * 60 * 1000  # 15 minutes in ms
+        grace_s = self.live_config.get('candle_close_grace_seconds', 5)
+        poll_s = self.live_config.get('poll_interval_seconds', 10)
+
+        # Calculate when the next bar closes
+        now_ms = int(time.time() * 1000)
+        next_bar_close = ((now_ms // timeframe_ms) + 1) * timeframe_ms
+
+        # Sleep until bar close + grace
+        wait_s = (next_bar_close - now_ms) / 1000.0 + grace_s
+        if wait_s > 0:
+            logger.info(f"Waiting {wait_s:.0f}s for next 15m bar close...")
+            # Sleep in chunks so we can respond to shutdown
+            end_time = time.time() + wait_s
+            while time.time() < end_time and self._running:
+                time.sleep(max(0, min(poll_s, end_time - time.time())))
+
+        if not self._running:
+            return None
+
+        # Fetch latest candles and pick the completed one
+        timeframe = self.live_config.get('timeframe', '15m')
+        candles = self.executor.get_latest_candles(
+            self.symbol, timeframe, limit=3)
+
+        if not candles or len(candles) < 2:
+            logger.warning("Failed to fetch candles")
+            return None
+
+        # Second-to-last is the most recently completed bar
+        completed = candles[-2]
+        candle_ts = int(completed[0])
+
+        # Verify it's newer than last processed
+        if candle_ts <= self.last_processed_bar_ts:
+            logger.debug("No new completed bar yet")
+            return None
+
+        self.last_processed_bar_ts = candle_ts
+        return {
+            'timestamp': candle_ts,
+            'open': float(completed[1]),
+            'high': float(completed[2]),
+            'low': float(completed[3]),
+            'close': float(completed[4]),
+            'volume': float(completed[5]),
+        }
+
+    def _append_candle(self, candle: dict):
+        """Append a new candle to the rolling buffer."""
+        new_row = pd.DataFrame([candle])
+        self.candle_buffer = pd.concat(
+            [self.candle_buffer, new_row], ignore_index=True)
+
+        # Trim to buffer size
+        if len(self.candle_buffer) > self.buffer_size:
+            self.candle_buffer = self.candle_buffer.iloc[-self.buffer_size:].reset_index(drop=True)
+
+    def _compute_indicators(self):
+        """Compute all indicators on the rolling buffer."""
+        df = self.candle_buffer
+        if df is None or len(df) < 30:
+            return None
+
+        try:
+            closes = df['close'].values.astype(np.float64)
+            highs = df['high'].values.astype(np.float64)
+            lows = df['low'].values.astype(np.float64)
+            opens = df['open'].values.astype(np.float64)
+            timestamps = df['timestamp'].values.astype(np.float64)
+
+            kama_p = self.config['kama_period']
+            atr_p = self.config['atr_period']
+
+            er = calculate_er(closes, kama_p)
+            kama = calculate_kama(closes, er,
+                                   self.config['kama_fast'],
+                                   self.config['kama_slow'])
+            atr = calculate_atr(highs, lows, closes, atr_p)
+            regime = detect_regime(kama, er, atr,
+                                    self.config['regime_threshold'],
+                                    self.config['er_trend_threshold'])
+            z_score = calculate_z_score(closes, atr, 20)
+            volatility = calculate_rolling_volatility(closes, atr_p)
+
+            return {
+                'open': opens, 'high': highs, 'low': lows, 'close': closes,
+                'timestamp': timestamps,
+                'kama': kama, 'er': er, 'atr': atr,
+                'regime': regime, 'z_score': z_score,
+                'volatility': volatility,
+            }
+        except Exception as e:
+            logger.error(f"Indicator computation failed: {e}", exc_info=True)
+            return None
+
+    # ─── Exchange State Sync ─────────────────────────────────────
+
+    def _sync_exchange_state(self):
+        """
+        Synchronize internal state with exchange.
+        Detect fills by comparing tracked orders with exchange open orders.
+        """
+        if not self.active_orders:
+            return
+
+        # Fetch current open orders
+        exchange_orders = self.executor.get_open_orders(self.symbol)
+        exchange_ids = {o['id'] for o in exchange_orders}
+
+        # Find orders that disappeared (filled or cancelled)
+        disappeared = []
+        for oid, info in list(self.active_orders.items()):
+            if oid not in exchange_ids:
+                disappeared.append((oid, info))
+
+        if not disappeared:
+            return
+
+        # Fetch positions BEFORE processing to compare size changes
+        positions_before = self.executor.get_positions(self.symbol)
+        prev_long_size = positions_before['long']['size']
+        prev_short_size = positions_before['short']['size']
+
+        for oid, order_info in disappeared:
+            # Try to determine if order was filled or cancelled
+            try:
+                order_status = self.executor.exchange.fetch_order(oid, self.symbol)
+                status = order_status.get('status', 'unknown')
+                if status in ('closed',):
+                    # Order was filled
+                    fill_price = float(order_status.get('average', 0) or
+                                       order_status.get('price', 0) or
+                                       order_info['price'])
+                    logger.info(f"Order {oid} FILLED @ {fill_price:.2f}")
+                    self._process_live_fill(order_info, fill_price)
+                elif status in ('canceled', 'cancelled', 'expired', 'rejected'):
+                    logger.info(f"Order {oid} was {status}, not a fill")
+                else:
+                    logger.warning(f"Order {oid} unknown status '{status}', skipping")
+            except Exception as e:
+                # If we can't check status, compare position sizes to infer
+                logger.warning(f"Could not fetch order {oid} status: {e}. "
+                               f"Inferring from position change.")
+                # Conservative: skip and let reconciliation handle it
+            del self.active_orders[oid]
+
+        # Reconcile position sizes (exchange is always truth)
+        positions_after = self.executor.get_positions(self.symbol)
+        self._reconcile_positions(positions_after)
+
+    def _process_live_fill(self, order_info: dict, fill_price: float):
+        """Process a detected fill from exchange sync."""
+        direction = order_info['direction']
+        side = order_info['side']
+        qty = order_info['qty']
+        reduce_only = order_info['reduce_only']
+        fee_rate = self.config['fee_taker']
+        fee = qty * fill_price * fee_rate
+        timestamp = time.time() * 1000
+
+        # Use cached regime from last indicator computation
+        regime = self._last_regime
+
+        pnl = 0.0
+        label = ''
+
+        if direction == DIR_LONG:
+            if side == 'buy' and not reduce_only:
+                # Opening long
+                self.pos_long.add_fill(fill_price, qty, timestamp, fee)
+                self.wallet_balance -= fee
+                self.metrics['longs_opened'] += 1
+                label = LABEL_BUY_OPEN_LONG
+            elif side == 'sell':
+                # Closing long (take-profit)
+                pnl = self.pos_long.close_fill(fill_price, qty, fee)
+                self.wallet_balance += pnl
+                self.metrics['longs_closed'] += 1
+                label = LABEL_SELL_CLOSE_LONG
+                if pnl > 0:
+                    self.accumulated_profit_long += pnl
+        elif direction == DIR_SHORT:
+            if side == 'sell' and not reduce_only:
+                # Opening short
+                self.pos_short.add_fill(fill_price, qty, timestamp, fee)
+                self.wallet_balance -= fee
+                self.metrics['shorts_opened'] += 1
+                label = LABEL_SELL_OPEN_SHORT
+            elif side == 'buy':
+                # Closing short (take-profit)
+                pnl = self.pos_short.close_fill(fill_price, qty, fee)
+                self.wallet_balance += pnl
+                self.metrics['shorts_closed'] += 1
+                label = LABEL_BUY_CLOSE_SHORT
+                if pnl > 0:
+                    self.accumulated_profit_short += pnl
+
+        if label:
+            trade = {
+                'timestamp': int(timestamp),
+                'datetime': datetime.now(timezone.utc).isoformat(),
+                'symbol': self.symbol,
+                'price': fill_price,
+                'qty': qty,
+                'label': label,
+                'regime': regime,
+                'pnl': pnl,
+                'exchange_order_id': order_info.get('exchange_id', ''),
+                'fill_price': fill_price,
+                'fee': fee,
+                'wallet_balance_after': self.wallet_balance,
+                'equity_after': self._total_equity(fill_price),
+                'pos_long_size': self.pos_long.size,
+                'pos_short_size': self.pos_short.size,
+            }
+            self.trade_logger.log_trade(trade)
+            self.state.save_trade(trade)
+
+        self.grid_needs_regen = True
+
+    def _reconcile_positions(self, exchange_positions: dict):
+        """Adjust internal tracker if exchange shows different position size."""
+        tolerance = self.live_config.get('position_sync_tolerance_pct', 0.02)
+
+        for side_key, tracker in [('long', self.pos_long), ('short', self.pos_short)]:
+            ex_size = exchange_positions[side_key]['size']
+            int_size = tracker.size
+
+            if abs(ex_size - int_size) > max(ex_size, int_size, 1e-9) * tolerance:
+                if abs(ex_size - int_size) > 1e-8:
+                    logger.warning(
+                        f"Reconciling {side_key.upper()}: "
+                        f"exchange={ex_size:.8f} → internal was {int_size:.8f}")
+                    # Exchange is truth — adjust internal to match
+                    if ex_size > int_size:
+                        # Position grew externally (manual open)
+                        diff = ex_size - int_size
+                        avg_entry = exchange_positions[side_key].get('avg_entry', 0)
+                        if avg_entry > 0:
+                            tracker.add_fill(avg_entry, diff, time.time() * 1000, 0)
+                    elif ex_size < int_size and ex_size < 1e-8:
+                        # Position was fully closed externally
+                        tracker.size = 0.0
+                        tracker.avg_entry = 0.0
+                        tracker.fills.clear()
+                        tracker.num_fills = 0
+                    elif ex_size < int_size:
+                        # Position was partially closed externally
+                        excess = int_size - ex_size
+                        avg_entry = exchange_positions[side_key].get('avg_entry', 0) or tracker.avg_entry
+                        tracker.close_fill(avg_entry, excess, 0)
+
+    # ─── Strategy Step (11-step loop) ────────────────────────────
+
+    def _execute_strategy_step(self, indicators: dict):
+        """Execute one iteration of the 11-step strategy loop."""
+        # Need at least 2 bars for prev/current
+        if len(indicators['close']) < 2:
+            return
+
+        # ─── PREV BAR indicators (no lookahead) ─────────────
+        prev_kama = indicators['kama'][-2]
+        prev_atr = indicators['atr'][-2]
+        prev_regime = int(indicators['regime'][-2])
+        prev_z = indicators['z_score'][-2]
+        prev_er = indicators['er'][-2]
+        prev_vol = indicators['volatility'][-2]
+
+        # Cache regime for use in fill processing
+        self._last_regime = prev_regime
+
+        # ─── CURRENT BAR price action ────────────────────────
+        cur_close = indicators['close'][-1]
+        cur_high = indicators['high'][-1]
+        cur_low = indicators['low'][-1]
+        cur_time = indicators['timestamp'][-1]
+
+        # Extract config params
+        leverage = self.config.get('leverage', 1.0)
+        allow_short = self.config.get('allow_short', True)
+        fee_rate = self.config['fee_taker']
+        order_pct = self.config['order_pct']
+        grid_levels = self.config['grid_levels']
+        gamma = self.config['gamma']
+        kappa = self.config.get('kappa', 1.5)
+        spacing_k = self.config['grid_spacing_k']
+        spacing_floor = self.config.get('spacing_floor', 0.005)
+        max_inv_per_side = self.config.get('max_inventory_per_side', 10)
+        atr_sl_mult = self.config.get('atr_sl_mult', 3.5)
+        max_position_pct = self.config.get('max_position_pct', 0.7)
+        trailing_enabled = self.config.get('trailing_enabled', True)
+        trailing_er = self.config.get('trailing_activation_er', 0.65)
+        cb_enabled = self.config.get('circuit_breaker_enabled', True)
+        halt_z = self.config.get('halt_z_threshold', -3.0)
+        resume_z = self.config.get('resume_z_threshold', -1.0)
+        max_dd_pct = self.config.get('max_drawdown_pct', 0.15)
+
+        # ─── 1. REGIME (already computed) ────────────────────
+
+        # ─── 2. CIRCUIT BREAKER ──────────────────────────────
+        if cb_enabled:
+            if not self.halted and prev_z < halt_z:
+                self.halted = True
+                self.metrics['circuit_breaker_triggers'] += 1
+                self.executor.cancel_all_orders(self.symbol)
+                self.active_orders.clear()
+                self.trade_logger.log_event(
+                    'CIRCUIT_BREAKER',
+                    f'Z-Score: {prev_z:.2f} < {halt_z}. All orders cancelled.')
+                self._log_trade_event(
+                    cur_time, cur_close, 0, LABEL_CIRCUIT_BREAKER, prev_regime, 0)
+
+            if self.halted and prev_z > resume_z:
+                self.halted = False
+                self.grid_needs_regen = True
+                self.trade_logger.log_event(
+                    'CB_RESUME',
+                    f'Z-Score: {prev_z:.2f} > {resume_z}. Trading resumed.')
+
+        if self.halted:
+            self._update_equity(cur_close)
+            self._log_equity_bar(cur_time, cur_close, prev_regime)
+            return
+
+        # ─── 3. STOP LOSS (ATR-based) ────────────────────────
+        if self.pos_long.is_open:
+            stop_price = self.pos_long.avg_entry - atr_sl_mult * prev_atr
+            if cur_low <= stop_price:
+                logger.info(f"STOP LOSS LONG triggered: low={cur_low:.2f} <= stop={stop_price:.2f}")
+                order = self.executor.place_market_order(
+                    self.symbol, 'sell', self.pos_long.size,
+                    'LONG', reduce_only=True)
+                actual_price = float(order.get('average', stop_price) or stop_price) if order else stop_price
+                fee = self.pos_long.size * actual_price * fee_rate
+                pnl = self.pos_long.close_all(actual_price, fee)
+                self.wallet_balance += pnl
+                self.metrics['stops_long'] += 1
+                self.grid_needs_regen = True
+                self._log_trade_event(
+                    cur_time, actual_price, 0, LABEL_STOP_LONG, prev_regime, pnl)
+
+        if self.pos_short.is_open:
+            stop_price = self.pos_short.avg_entry + atr_sl_mult * prev_atr
+            if cur_high >= stop_price:
+                logger.info(f"STOP LOSS SHORT triggered: high={cur_high:.2f} >= stop={stop_price:.2f}")
+                order = self.executor.place_market_order(
+                    self.symbol, 'buy', self.pos_short.size,
+                    'SHORT', reduce_only=True)
+                actual_price = float(order.get('average', stop_price) or stop_price) if order else stop_price
+                fee = self.pos_short.size * actual_price * fee_rate
+                pnl = self.pos_short.close_all(actual_price, fee)
+                self.wallet_balance += pnl
+                self.metrics['stops_short'] += 1
+                self.grid_needs_regen = True
+                self._log_trade_event(
+                    cur_time, actual_price, 0, LABEL_STOP_SHORT, prev_regime, pnl)
+
+        # ─── 4. LIQUIDATION CHECK ────────────────────────────
+        if self.pos_long.is_open and leverage > 1.0:
+            liq_price = calculate_liquidation_price(
+                self.pos_long.avg_entry, self.pos_long.size,
+                self.wallet_balance, 1, leverage)
+            if cur_close <= liq_price and liq_price > 0:
+                logger.critical(f"LIQUIDATION LONG: price={cur_close:.2f} <= liq={liq_price:.2f}")
+                self.executor.place_market_order(
+                    self.symbol, 'sell', self.pos_long.size,
+                    'LONG', reduce_only=True)
+                pnl = self.pos_long.close_all(cur_close, 0)
+                self.wallet_balance += pnl
+                self.metrics['liquidations'] += 1
+                self.grid_needs_regen = True
+                self._log_trade_event(
+                    cur_time, cur_close, 0, LABEL_LIQUIDATION, prev_regime, pnl)
+
+        if self.pos_short.is_open and leverage > 1.0:
+            liq_price = calculate_liquidation_price(
+                self.pos_short.avg_entry, self.pos_short.size,
+                self.wallet_balance, -1, leverage)
+            if cur_close >= liq_price and liq_price > 0:
+                logger.critical(f"LIQUIDATION SHORT: price={cur_close:.2f} >= liq={liq_price:.2f}")
+                self.executor.place_market_order(
+                    self.symbol, 'buy', self.pos_short.size,
+                    'SHORT', reduce_only=True)
+                pnl = self.pos_short.close_all(cur_close, 0)
+                self.wallet_balance += pnl
+                self.metrics['liquidations'] += 1
+                self.grid_needs_regen = True
+                self._log_trade_event(
+                    cur_time, cur_close, 0, LABEL_LIQUIDATION, prev_regime, pnl)
+
+        # ─── 5. PRUNING (5 methods, both sides) ─────────────
+        grid_spacing = calculate_dynamic_spacing(
+            prev_atr, spacing_k, spacing_floor, cur_close)
+        grid_profit_potential = grid_spacing * order_pct * self.wallet_balance / max(cur_close, 1)
+
+        # Use current system time for pruning age checks (in ms to match fill timestamps)
+        prune_time = time.time() * 1000
+
+        for pos, acc_profit, side_key in [
+            (self.pos_long, self.accumulated_profit_long, 'long'),
+            (self.pos_short, self.accumulated_profit_short, 'short'),
+        ]:
+            if not pos.is_open:
+                continue
+            anchor = self.grid_anchor_long if pos.side == 1 else self.grid_anchor_short
+            prune_idx, prune_label = run_pruning_cycle(
+                pos, cur_close, prune_time, prev_kama, prev_atr,
+                anchor, grid_spacing, grid_profit_potential,
+                acc_profit, self.config)
+            if prune_idx >= 0 and prune_idx < len(pos.fills):
+                fill = pos.fills[prune_idx]
+                fill_qty = fill['qty']
+
+                # Market close the specific fill
+                close_side = 'sell' if pos.side == 1 else 'buy'
+                pos_side = 'LONG' if pos.side == 1 else 'SHORT'
+                self.executor.place_market_order(
+                    self.symbol, close_side, fill_qty,
+                    pos_side, reduce_only=True)
+
+                fee = fill_qty * cur_close * fee_rate
+                pnl = pos.close_specific_fill(prune_idx, cur_close, fee)
+                self.wallet_balance += pnl
+                self.metrics['prune_count'] += 1
+                self.metrics['prune_types'][prune_label] = \
+                    self.metrics['prune_types'].get(prune_label, 0) + 1
+                self.grid_needs_regen = True
+                self._log_trade_event(
+                    cur_time, cur_close, fill_qty, prune_label, prev_regime, pnl)
+
+        # ─── 6. TRAILING UP ──────────────────────────────────
+        if trailing_enabled and prev_regime in (REGIME_UPTREND, REGIME_BREAKOUT_UP):
+            if prev_er > trailing_er:
+                top_level = self.grid_anchor_long + grid_spacing * grid_levels
+                if cur_close > top_level:
+                    shift = cur_close - self.grid_anchor_long
+                    self.grid_anchor_long += shift * 0.5
+                    self.trailing_anchor = self.grid_anchor_long
+                    self.grid_needs_regen = True
+                    self.metrics['trailing_shifts'] += 1
+                    self.trade_logger.log_event(
+                        'TRAILING_UP',
+                        f'Anchor shifted to {self.grid_anchor_long:.2f}')
+
+        # ─── 7. VaR CONSTRAINT ───────────────────────────────
+        total_exposure = (self.pos_long.size + self.pos_short.size) * cur_close
+        var_blocked = check_var_constraint(
+            total_exposure, prev_vol, max_dd_pct,
+            self._total_equity(cur_close))
+        if var_blocked:
+            self.metrics['var_blocks'] += 1
+
+        # ─── 8. GENERATE GRID + PLACE ORDERS ─────────────────
+        if self.grid_needs_regen and not var_blocked:
+            # Cancel existing orders and re-fetch to catch race condition fills
+            cancel_result = self.executor.cancel_all_orders(self.symbol)
+            if cancel_result < 0:
+                logger.error("Failed to cancel orders, skipping grid regeneration")
+                return
+            self.active_orders.clear()
+            time.sleep(0.5)  # Brief pause for cancel to propagate
+
+            # Check for fills during cancel
+            self._sync_positions_from_exchange()
+
+            # Fetch real funding rate
+            funding_rate = self.executor.get_funding_rate(self.symbol)
+            long_bias, short_bias = should_bias_for_funding(prev_regime, funding_rate)
+
+            self._place_grid_on_exchange(
+                cur_close, prev_atr, prev_vol, prev_regime, funding_rate,
+                cur_time, grid_levels, spacing_k, spacing_floor,
+                gamma, kappa, order_pct, leverage, max_inv_per_side,
+                max_position_pct, allow_short, long_bias, short_bias)
+            self.grid_needs_regen = False
+
+        # ─── 10. FUNDING RATE ────────────────────────────────
+        if is_funding_interval(self.bar_count):
+            real_rate = self.executor.get_funding_rate(self.symbol)
+            if self.pos_long.is_open:
+                f_pnl = apply_funding(self.pos_long.size, cur_close, real_rate, 1)
+                self.pos_long.add_funding(f_pnl)
+                self.wallet_balance += f_pnl
+                self.metrics['funding_pnl'] += f_pnl
+
+            if self.pos_short.is_open:
+                f_pnl = apply_funding(self.pos_short.size, cur_close, real_rate, -1)
+                self.pos_short.add_funding(f_pnl)
+                self.wallet_balance += f_pnl
+                self.metrics['funding_pnl'] += f_pnl
+
+        # ─── 11. LOG EQUITY ──────────────────────────────────
+        self._update_equity(cur_close)
+        self._log_equity_bar(cur_time, cur_close, prev_regime)
+
+    # ─── Grid Placement ──────────────────────────────────────────
+
+    def _place_grid_on_exchange(self, price, atr, vol, regime, funding_rate,
+                                 timestamp, grid_levels, spacing_k, spacing_floor,
+                                 gamma, kappa, order_pct, leverage,
+                                 max_inv_per_side, max_position_pct, allow_short,
+                                 long_bias, short_bias):
+        """Generate and place grid orders on exchange."""
+        base_spacing = calculate_dynamic_spacing(atr, spacing_k, spacing_floor, price)
+
+        # ─── LONG GRID ──────────────────────────────────────
+        can_open_long_entry = regime not in (REGIME_DOWNTREND, REGIME_BREAKOUT_DOWN)
+
+        inv_q_long = normalize_inventory(
+            self.pos_long.size,
+            max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
+        buy_sp, sell_sp, anchor_long = get_skewed_grid_params(
+            price, inv_q_long, gamma, vol, kappa,
+            spacing_floor * price, base_spacing)
+
+        self.grid_anchor_long = anchor_long
+        buy_levels, sell_levels = generate_grid_levels(
+            anchor_long, buy_sp * long_bias, sell_sp, grid_levels)
+
+        long_orders = 0
+
+        # Place long buy entries
+        if can_open_long_entry and self.pos_long.num_fills < max_inv_per_side:
+            max_notional = self.wallet_balance * max_position_pct
+            current_notional = self.pos_long.size * price
+            for lvl_i, lvl_price in enumerate(buy_levels):
+                if lvl_price <= 0 or current_notional >= max_notional:
+                    break
+                qty = calculate_order_qty(self.wallet_balance, lvl_price, order_pct, leverage)
+                if qty < 1e-12:
+                    continue
+                order = self.executor.place_limit_order(
+                    self.symbol, 'buy', qty, lvl_price, 'LONG',
+                    reduce_only=False,
+                    client_order_id=f'grid_L_BUY_{lvl_i}_{int(timestamp)}')
+                if order:
+                    self.active_orders[str(order['id'])] = {
+                        'side': 'buy', 'price': lvl_price, 'qty': qty,
+                        'direction': DIR_LONG, 'reduce_only': False,
+                        'grid_level': lvl_i, 'position_side': 'LONG',
+                        'placed_at': int(timestamp),
+                    }
+                    long_orders += 1
+
+        # Place long sell TPs
+        if self.pos_long.is_open:
+            tp_qty = self.pos_long.size / max(grid_levels, 1)
+            for lvl_i, lvl_price in enumerate(sell_levels):
+                if tp_qty < 1e-12:
+                    break
+                order = self.executor.place_limit_order(
+                    self.symbol, 'sell', tp_qty, lvl_price, 'LONG',
+                    reduce_only=True,
+                    client_order_id=f'grid_L_TP_{lvl_i}_{int(timestamp)}')
+                if order:
+                    self.active_orders[str(order['id'])] = {
+                        'side': 'sell', 'price': lvl_price, 'qty': tp_qty,
+                        'direction': DIR_LONG, 'reduce_only': True,
+                        'grid_level': lvl_i, 'position_side': 'LONG',
+                        'placed_at': int(timestamp),
+                    }
+                    long_orders += 1
+
+        if long_orders > 0:
+            self.trade_logger.log_grid_placement(
+                'LONG', long_orders,
+                (float(buy_levels[-1]) if len(buy_levels) > 0 else price,
+                 float(sell_levels[-1]) if len(sell_levels) > 0 else price))
+
+        # ─── SHORT GRID ─────────────────────────────────────
+        if not allow_short:
+            return
+
+        can_open_short_entry = regime not in (REGIME_UPTREND, REGIME_BREAKOUT_UP)
+
+        inv_q_short = normalize_inventory(
+            -self.pos_short.size,
+            max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
+        buy_sp_s, sell_sp_s, anchor_short = get_skewed_grid_params(
+            price, inv_q_short, gamma, vol, kappa,
+            spacing_floor * price, base_spacing)
+
+        self.grid_anchor_short = anchor_short
+        buy_levels_s, sell_levels_s = generate_grid_levels(
+            anchor_short, buy_sp_s, sell_sp_s * short_bias, grid_levels)
+
+        short_orders = 0
+
+        # Short sell entries
+        if can_open_short_entry and self.pos_short.num_fills < max_inv_per_side:
+            max_notional = self.wallet_balance * max_position_pct
+            current_notional = self.pos_short.size * price
+            for lvl_i, lvl_price in enumerate(sell_levels_s):
+                if current_notional >= max_notional:
+                    break
+                qty = calculate_order_qty(self.wallet_balance, lvl_price, order_pct, leverage)
+                if qty < 1e-12:
+                    continue
+                order = self.executor.place_limit_order(
+                    self.symbol, 'sell', qty, lvl_price, 'SHORT',
+                    reduce_only=False,
+                    client_order_id=f'grid_S_SELL_{lvl_i}_{int(timestamp)}')
+                if order:
+                    self.active_orders[str(order['id'])] = {
+                        'side': 'sell', 'price': lvl_price, 'qty': qty,
+                        'direction': DIR_SHORT, 'reduce_only': False,
+                        'grid_level': lvl_i, 'position_side': 'SHORT',
+                        'placed_at': int(timestamp),
+                    }
+                    short_orders += 1
+
+        # Short buy TPs
+        if self.pos_short.is_open:
+            tp_qty = self.pos_short.size / max(grid_levels, 1)
+            for lvl_i, lvl_price in enumerate(buy_levels_s):
+                if tp_qty < 1e-12 or lvl_price <= 0:
+                    break
+                order = self.executor.place_limit_order(
+                    self.symbol, 'buy', tp_qty, lvl_price, 'SHORT',
+                    reduce_only=True,
+                    client_order_id=f'grid_S_TP_{lvl_i}_{int(timestamp)}')
+                if order:
+                    self.active_orders[str(order['id'])] = {
+                        'side': 'buy', 'price': lvl_price, 'qty': tp_qty,
+                        'direction': DIR_SHORT, 'reduce_only': True,
+                        'grid_level': lvl_i, 'position_side': 'SHORT',
+                        'placed_at': int(timestamp),
+                    }
+                    short_orders += 1
+
+        if short_orders > 0:
+            self.trade_logger.log_grid_placement(
+                'SHORT', short_orders,
+                (float(buy_levels_s[-1]) if len(buy_levels_s) > 0 else price,
+                 float(sell_levels_s[-1]) if len(sell_levels_s) > 0 else price))
+
+    # ─── Equity Helpers ──────────────────────────────────────────
+
+    def _update_equity(self, price: float):
+        self.pos_long.update_unrealized(price)
+        self.pos_short.update_unrealized(price)
+
+    def _total_equity(self, price: float) -> float:
+        self._update_equity(price)
+        return (self.wallet_balance
+                + self.pos_long.unrealized_pnl
+                + self.pos_short.unrealized_pnl)
+
+    # ─── Logging Helpers ─────────────────────────────────────────
+
+    def _log_trade_event(self, timestamp, price, qty, label, regime, pnl):
+        """Log and persist a trade event."""
+        trade = {
+            'timestamp': int(timestamp),
+            'datetime': datetime.now(timezone.utc).isoformat(),
+            'symbol': self.symbol,
+            'price': price,
+            'qty': qty,
+            'label': label,
+            'regime': regime,
+            'pnl': pnl,
+            'exchange_order_id': '',
+            'fill_price': price,
+            'fee': 0.0,
+            'wallet_balance_after': self.wallet_balance,
+            'equity_after': self._total_equity(price),
+            'pos_long_size': self.pos_long.size,
+            'pos_short_size': self.pos_short.size,
+        }
+        self.trade_logger.log_trade(trade)
+        self.state.save_trade(trade)
+
+    def _log_equity_bar(self, timestamp, price, regime):
+        """Log equity snapshot for this bar."""
+        self.trade_logger.log_equity(
+            int(timestamp), self.wallet_balance,
+            self.pos_long.unrealized_pnl,
+            self.pos_short.unrealized_pnl,
+            self.pos_long.size, self.pos_short.size,
+            regime)
+
+    # ─── State Serialization ─────────────────────────────────────
+
+    def _serialize_state(self) -> dict:
+        """Serialize current state for persistence."""
+        def _serialize_pos(pos):
+            return {
+                'size': pos.size,
+                'avg_entry': pos.avg_entry,
+                'realized_pnl': pos.realized_pnl,
+                'unrealized_pnl': pos.unrealized_pnl,
+                'funding_pnl': pos.funding_pnl,
+                'num_fills': pos.num_fills,
+                'fills': [
+                    {'price': f['price'], 'qty': f['qty'],
+                     'timestamp': f['timestamp'], 'funding_cost': f['funding_cost']}
+                    for f in pos.fills
+                ],
+            }
+
+        return {
+            'version': 'v4.0',
+            'symbol': self.symbol,
+            'timestamp': int(time.time() * 1000),
+            'datetime': datetime.now(timezone.utc).isoformat(),
+            'wallet_balance': self.wallet_balance,
+            'initial_capital': self.initial_capital,
+            'pos_long': _serialize_pos(self.pos_long),
+            'pos_short': _serialize_pos(self.pos_short),
+            'halted': self.halted,
+            'grid_anchor_long': self.grid_anchor_long,
+            'grid_anchor_short': self.grid_anchor_short,
+            'trailing_anchor': self.trailing_anchor,
+            'grid_needs_regen': self.grid_needs_regen,
+            'accumulated_profit_long': self.accumulated_profit_long,
+            'accumulated_profit_short': self.accumulated_profit_short,
+            'bar_count': self.bar_count,
+            'last_processed_bar_ts': self.last_processed_bar_ts,
+            'active_orders': self.active_orders,
+            'metrics': self.metrics,
+        }
+
+    # ─── Shutdown ────────────────────────────────────────────────
+
+    def shutdown(self):
+        """Graceful shutdown: cancel orders, save state, keep positions."""
+        if not self._running:
+            return  # Already shutting down (idempotent guard)
+        self._running = False
+        logger.info("Initiating graceful shutdown...")
+
+        # Cancel all open orders
+        self.executor.cancel_all_orders(self.symbol)
+        self.active_orders.clear()
+
+        # Save final state
+        self.state.save(self._serialize_state())
+        self.state.save_snapshot(self._serialize_state(), label='shutdown')
+
+        # Log session summary
+        if self._session_start:
+            duration = (datetime.now(timezone.utc) - self._session_start).total_seconds() / 3600
+        else:
+            duration = 0
+        self.trade_logger.log_session_summary(self.metrics, duration)
+
+        logger.info("Shutdown complete. Positions left open on exchange.")
+
+    def emergency_shutdown(self):
+        """Emergency shutdown: cancel orders AND close all positions."""
+        self._running = False
+        logger.critical("EMERGENCY SHUTDOWN — closing all positions")
+
+        # Cancel orders
+        self.executor.cancel_all_orders(self.symbol)
+        self.active_orders.clear()
+
+        # Get current price for PnL calculation
+        ticker = self.executor.get_ticker(self.symbol)
+        price = ticker.get('last', 0)
+        if price <= 0:
+            # Fallback to last known price from buffer
+            if self.candle_buffer is not None and len(self.candle_buffer) > 0:
+                price = float(self.candle_buffer['close'].iloc[-1])
+
+        fee_rate = self.config.get('fee_taker', 0.0002)
+
+        # Close long position
+        if self.pos_long.is_open:
+            self.executor.place_market_order(
+                self.symbol, 'sell', self.pos_long.size,
+                'LONG', reduce_only=True)
+            fee = self.pos_long.size * price * fee_rate
+            pnl = self.pos_long.close_all(price, fee)
+            self.wallet_balance += pnl
+
+        # Close short position
+        if self.pos_short.is_open:
+            self.executor.place_market_order(
+                self.symbol, 'buy', self.pos_short.size,
+                'SHORT', reduce_only=True)
+            fee = self.pos_short.size * price * fee_rate
+            pnl = self.pos_short.close_all(price, fee)
+            self.wallet_balance += pnl
+
+        # Save state
+        self.state.save(self._serialize_state())
+        self.state.save_snapshot(self._serialize_state(), label='emergency')
+
+        if self._session_start:
+            duration = (datetime.now(timezone.utc) - self._session_start).total_seconds() / 3600
+        else:
+            duration = 0
+        self.trade_logger.log_session_summary(self.metrics, duration)
+
+        logger.critical("Emergency shutdown complete. All positions closed.")

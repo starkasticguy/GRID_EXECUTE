@@ -1,0 +1,8 @@
+ccxt
+pandas
+numpy
+optuna
+matplotlib
+pyarrow
+pytest
+python-dotenv

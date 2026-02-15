@@ -1,0 +1,15 @@
+{
+    "kama_period": 29,
+    "grid_spacing_k": 0.5000844670481057,
+    "grid_levels": 4,
+    "gamma": 0.8073486673188088,
+    "kappa": 2.1396980608779472,
+    "order_pct": 0.04999719568696284,
+    "atr_sl_mult": 3.3285830660169395,
+    "regime_threshold": 0.2940875104844324,
+    "er_trend_threshold": 0.6248712121898943,
+    "trailing_enabled": true,
+    "allow_short": true,
+    "max_position_age_hours": 9,
+    "deviance_sigma": 4.679956065163205
+}

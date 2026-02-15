@@ -1,0 +1,133 @@
+{
+  "version": "v4.0",
+  "symbol": "SOL/USDT:USDT",
+  "timestamp": 1771179308213,
+  "datetime": "2026-02-15T18:15:08.213158+00:00",
+  "wallet_balance": 100.049637,
+  "initial_capital": 100.02962965,
+  "pos_long": {
+    "size": 0.0,
+    "avg_entry": 0.0,
+    "realized_pnl": 0.0,
+    "unrealized_pnl": 0.0,
+    "funding_pnl": 0.0,
+    "num_fills": 0,
+    "fills": []
+  },
+  "pos_short": {
+    "size": 0.0,
+    "avg_entry": 0.0,
+    "realized_pnl": 0.0,
+    "unrealized_pnl": 0.0,
+    "funding_pnl": 0.0,
+    "num_fills": 0,
+    "fills": []
+  },
+  "halted": false,
+  "grid_anchor_long": 86.46,
+  "grid_anchor_short": 86.46,
+  "trailing_anchor": 87.02,
+  "grid_needs_regen": false,
+  "accumulated_profit_long": 0.0,
+  "accumulated_profit_short": 0.0,
+  "bar_count": 0,
+  "last_processed_bar_ts": 1771178400000,
+  "active_orders": {
+    "197636471706": {
+      "side": "buy",
+      "price": 86.0277,
+      "qty": 0.11629280521270703,
+      "direction": 1,
+      "reduce_only": false,
+      "grid_level": 0,
+      "position_side": "LONG",
+      "placed_at": 1771178400000
+    },
+    "197636474692": {
+      "side": "buy",
+      "price": 85.5954,
+      "qty": 0.1168801426127712,
+      "direction": 1,
+      "reduce_only": false,
+      "grid_level": 1,
+      "position_side": "LONG",
+      "placed_at": 1771178400000
+    },
+    "197636474846": {
+      "side": "buy",
+      "price": 85.1631,
+      "qty": 0.11747344282907968,
+      "direction": 1,
+      "reduce_only": false,
+      "grid_level": 2,
+      "position_side": "LONG",
+      "placed_at": 1771178400000
+    },
+    "197636476230": {
+      "side": "buy",
+      "price": 84.73079999999999,
+      "qty": 0.11807279712922807,
+      "direction": 1,
+      "reduce_only": false,
+      "grid_level": 3,
+      "position_side": "LONG",
+      "placed_at": 1771178400000
+    },
+    "197636477298": {
+      "side": "sell",
+      "price": 86.89229999999999,
+      "qty": 0.1151356628722821,
+      "direction": -1,
+      "reduce_only": false,
+      "grid_level": 0,
+      "position_side": "SHORT",
+      "placed_at": 1771178400000
+    },
+    "197636478200": {
+      "side": "sell",
+      "price": 87.32459999999999,
+      "qty": 0.11456568434321139,
+      "direction": -1,
+      "reduce_only": false,
+      "grid_level": 1,
+      "position_side": "SHORT",
+      "placed_at": 1771178400000
+    },
+    "197636479700": {
+      "side": "sell",
+      "price": 87.75689999999999,
+      "qty": 0.11400132136615124,
+      "direction": -1,
+      "reduce_only": false,
+      "grid_level": 2,
+      "position_side": "SHORT",
+      "placed_at": 1771178400000
+    },
+    "197636480680": {
+      "side": "sell",
+      "price": 88.1892,
+      "qty": 0.1134424913594544,
+      "direction": -1,
+      "reduce_only": false,
+      "grid_level": 3,
+      "position_side": "SHORT",
+      "placed_at": 1771178400000
+    }
+  },
+  "metrics": {
+    "longs_opened": 0,
+    "longs_closed": 0,
+    "shorts_opened": 0,
+    "shorts_closed": 0,
+    "stops_long": 0,
+    "stops_short": 0,
+    "prune_count": 0,
+    "prune_types": {},
+    "circuit_breaker_triggers": 0,
+    "trailing_shifts": 0,
+    "funding_pnl": 0.0,
+    "var_blocks": 0,
+    "liquidations": 0
+  },
+  "_saved_at": "2026-02-15T18:15:08.213206+00:00"
+}
