@@ -706,14 +706,18 @@ class LiveRunner:
                 order = self.executor.place_market_order(
                     self.symbol, 'sell', self.pos_long.size,
                     'LONG', reduce_only=True)
-                actual_price = float(order.get('average', stop_price) or stop_price) if order else stop_price
-                fee = self.pos_long.size * actual_price * fee_rate
-                pnl = self.pos_long.close_all(actual_price, fee)
-                self.wallet_balance += pnl
-                self.metrics['stops_long'] += 1
-                self.grid_needs_regen = True
-                self._log_trade_event(
-                    cur_time, actual_price, 0, LABEL_STOP_LONG, prev_regime, pnl)
+                if order is None:
+                    logger.warning(f"Stop loss market order failed for LONG "
+                                   f"(size={self.pos_long.size}), skipping internal close")
+                else:
+                    actual_price = float(order.get('average', stop_price) or stop_price)
+                    fee = self.pos_long.size * actual_price * fee_rate
+                    pnl = self.pos_long.close_all(actual_price, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_long'] += 1
+                    self.grid_needs_regen = True
+                    self._log_trade_event(
+                        cur_time, actual_price, 0, LABEL_STOP_LONG, prev_regime, pnl)
 
         if self.pos_short.is_open:
             stop_price = self.pos_short.avg_entry + atr_sl_mult * prev_atr
@@ -722,14 +726,18 @@ class LiveRunner:
                 order = self.executor.place_market_order(
                     self.symbol, 'buy', self.pos_short.size,
                     'SHORT', reduce_only=True)
-                actual_price = float(order.get('average', stop_price) or stop_price) if order else stop_price
-                fee = self.pos_short.size * actual_price * fee_rate
-                pnl = self.pos_short.close_all(actual_price, fee)
-                self.wallet_balance += pnl
-                self.metrics['stops_short'] += 1
-                self.grid_needs_regen = True
-                self._log_trade_event(
-                    cur_time, actual_price, 0, LABEL_STOP_SHORT, prev_regime, pnl)
+                if order is None:
+                    logger.warning(f"Stop loss market order failed for SHORT "
+                                   f"(size={self.pos_short.size}), skipping internal close")
+                else:
+                    actual_price = float(order.get('average', stop_price) or stop_price)
+                    fee = self.pos_short.size * actual_price * fee_rate
+                    pnl = self.pos_short.close_all(actual_price, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_short'] += 1
+                    self.grid_needs_regen = True
+                    self._log_trade_event(
+                        cur_time, actual_price, 0, LABEL_STOP_SHORT, prev_regime, pnl)
 
         # ─── 4. LIQUIDATION CHECK ────────────────────────────
         if self.pos_long.is_open and leverage > 1.0:
@@ -738,15 +746,18 @@ class LiveRunner:
                 self.wallet_balance, 1, leverage)
             if cur_close <= liq_price and liq_price > 0:
                 logger.critical(f"LIQUIDATION LONG: price={cur_close:.2f} <= liq={liq_price:.2f}")
-                self.executor.place_market_order(
+                order = self.executor.place_market_order(
                     self.symbol, 'sell', self.pos_long.size,
                     'LONG', reduce_only=True)
-                pnl = self.pos_long.close_all(cur_close, 0)
-                self.wallet_balance += pnl
-                self.metrics['liquidations'] += 1
-                self.grid_needs_regen = True
-                self._log_trade_event(
-                    cur_time, cur_close, 0, LABEL_LIQUIDATION, prev_regime, pnl)
+                if order is None:
+                    logger.critical("Liquidation market order failed for LONG!")
+                else:
+                    pnl = self.pos_long.close_all(cur_close, 0)
+                    self.wallet_balance += pnl
+                    self.metrics['liquidations'] += 1
+                    self.grid_needs_regen = True
+                    self._log_trade_event(
+                        cur_time, cur_close, 0, LABEL_LIQUIDATION, prev_regime, pnl)
 
         if self.pos_short.is_open and leverage > 1.0:
             liq_price = calculate_liquidation_price(
@@ -754,15 +765,18 @@ class LiveRunner:
                 self.wallet_balance, -1, leverage)
             if cur_close >= liq_price and liq_price > 0:
                 logger.critical(f"LIQUIDATION SHORT: price={cur_close:.2f} >= liq={liq_price:.2f}")
-                self.executor.place_market_order(
+                order = self.executor.place_market_order(
                     self.symbol, 'buy', self.pos_short.size,
                     'SHORT', reduce_only=True)
-                pnl = self.pos_short.close_all(cur_close, 0)
-                self.wallet_balance += pnl
-                self.metrics['liquidations'] += 1
-                self.grid_needs_regen = True
-                self._log_trade_event(
-                    cur_time, cur_close, 0, LABEL_LIQUIDATION, prev_regime, pnl)
+                if order is None:
+                    logger.critical("Liquidation market order failed for SHORT!")
+                else:
+                    pnl = self.pos_short.close_all(cur_close, 0)
+                    self.wallet_balance += pnl
+                    self.metrics['liquidations'] += 1
+                    self.grid_needs_regen = True
+                    self._log_trade_event(
+                        cur_time, cur_close, 0, LABEL_LIQUIDATION, prev_regime, pnl)
 
         # ─── 5. PRUNING (5 methods, both sides) ─────────────
         grid_spacing = calculate_dynamic_spacing(
@@ -791,9 +805,15 @@ class LiveRunner:
                 # Market close the specific fill
                 close_side = 'sell' if pos.side == 1 else 'buy'
                 pos_side = 'LONG' if pos.side == 1 else 'SHORT'
-                self.executor.place_market_order(
+                order = self.executor.place_market_order(
                     self.symbol, close_side, fill_qty,
                     pos_side, reduce_only=True)
+
+                if order is None:
+                    logger.warning(
+                        f"Prune market order failed for {fill_qty} {pos_side}, "
+                        f"skipping internal close to avoid desync")
+                    continue
 
                 fee = fill_qty * cur_close * fee_rate
                 pnl = pos.close_specific_fill(prune_idx, cur_close, fee)
@@ -855,9 +875,13 @@ class LiveRunner:
             # Places STOP_MARKET orders on Binance so stops execute
             # in real-time between candles, not just at 15m checks.
             # The candle-based stop (step 3) remains as a backup.
+            # If position is below exchange minimum order qty, skip SL
+            # (executor will reject it anyway, but log here for clarity).
+            min_qty = self.executor._min_amount(self.symbol) or 0.01
+
             if self.pos_long.is_open:
                 sl_price = self.pos_long.avg_entry - atr_sl_mult * prev_atr
-                if sl_price > 0:
+                if sl_price > 0 and self.pos_long.size >= min_qty:
                     sl_order = self.executor.place_stop_loss(
                         self.symbol, 'sell', self.pos_long.size,
                         sl_price, 'LONG',
@@ -871,22 +895,29 @@ class LiveRunner:
                             'placed_at': int(cur_time),
                             'order_type': 'STOP_MARKET',
                         }
+                elif sl_price > 0:
+                    logger.info(f"Long position {self.pos_long.size} below min qty "
+                                f"{min_qty}, skipping exchange SL (candle SL still active)")
 
             if self.pos_short.is_open and allow_short:
                 sl_price = self.pos_short.avg_entry + atr_sl_mult * prev_atr
-                sl_order = self.executor.place_stop_loss(
-                    self.symbol, 'buy', self.pos_short.size,
-                    sl_price, 'SHORT',
-                    client_order_id=f'sl_S_{int(cur_time)}')
-                if sl_order:
-                    self.conditional_orders[str(sl_order['id'])] = {
-                        'side': 'buy', 'price': sl_price,
-                        'qty': float(sl_order.get('amount', self.pos_short.size)),
-                        'direction': DIR_SHORT, 'reduce_only': True,
-                        'position_side': 'SHORT',
-                        'placed_at': int(cur_time),
-                        'order_type': 'STOP_MARKET',
-                    }
+                if self.pos_short.size >= min_qty:
+                    sl_order = self.executor.place_stop_loss(
+                        self.symbol, 'buy', self.pos_short.size,
+                        sl_price, 'SHORT',
+                        client_order_id=f'sl_S_{int(cur_time)}')
+                    if sl_order:
+                        self.conditional_orders[str(sl_order['id'])] = {
+                            'side': 'buy', 'price': sl_price,
+                            'qty': float(sl_order.get('amount', self.pos_short.size)),
+                            'direction': DIR_SHORT, 'reduce_only': True,
+                            'position_side': 'SHORT',
+                            'placed_at': int(cur_time),
+                            'order_type': 'STOP_MARKET',
+                        }
+                else:
+                    logger.info(f"Short position {self.pos_short.size} below min qty "
+                                f"{min_qty}, skipping exchange SL (candle SL still active)")
 
             self.grid_needs_regen = False
 
@@ -977,24 +1008,44 @@ class LiveRunner:
 
         # Place long TPs as TAKE_PROFIT_MARKET conditional orders
         # Equal-split across grid levels (matches backtest strategy.py)
+        # If per-level qty is below exchange minimum, aggregate into a single TP.
         if self.pos_long.is_open:
+            min_qty = self.executor._min_amount(self.symbol) or 0.01
             tp_qty_per_level = self.pos_long.size / max(grid_levels, 1)
-            for lvl_i, lvl_price in enumerate(sell_levels):
-                if tp_qty_per_level < 1e-12:
-                    break
-                order = self.executor.place_take_profit(
-                    self.symbol, 'sell', tp_qty_per_level, lvl_price, 'LONG',
-                    client_order_id=f'grid_L_TP_{lvl_i}_{int(timestamp)}')
-                if order:
-                    actual_qty = float(order.get('amount', tp_qty_per_level))
-                    self.conditional_orders[str(order['id'])] = {
-                        'side': 'sell', 'price': lvl_price, 'qty': actual_qty,
-                        'direction': DIR_LONG, 'reduce_only': True,
-                        'grid_level': lvl_i, 'position_side': 'LONG',
-                        'placed_at': int(timestamp),
-                        'order_type': 'TAKE_PROFIT_MARKET',
-                    }
-                    long_orders += 1
+
+            if tp_qty_per_level < min_qty:
+                # Position too small to split — place single TP at first sell level
+                if self.pos_long.size >= min_qty and len(sell_levels) > 0:
+                    order = self.executor.place_take_profit(
+                        self.symbol, 'sell', self.pos_long.size, sell_levels[0], 'LONG',
+                        client_order_id=f'grid_L_TP_agg_{int(timestamp)}')
+                    if order:
+                        actual_qty = float(order.get('amount', self.pos_long.size))
+                        self.conditional_orders[str(order['id'])] = {
+                            'side': 'sell', 'price': sell_levels[0], 'qty': actual_qty,
+                            'direction': DIR_LONG, 'reduce_only': True,
+                            'grid_level': 0, 'position_side': 'LONG',
+                            'placed_at': int(timestamp),
+                            'order_type': 'TAKE_PROFIT_MARKET',
+                        }
+                        long_orders += 1
+            else:
+                for lvl_i, lvl_price in enumerate(sell_levels):
+                    if tp_qty_per_level < 1e-12:
+                        break
+                    order = self.executor.place_take_profit(
+                        self.symbol, 'sell', tp_qty_per_level, lvl_price, 'LONG',
+                        client_order_id=f'grid_L_TP_{lvl_i}_{int(timestamp)}')
+                    if order:
+                        actual_qty = float(order.get('amount', tp_qty_per_level))
+                        self.conditional_orders[str(order['id'])] = {
+                            'side': 'sell', 'price': lvl_price, 'qty': actual_qty,
+                            'direction': DIR_LONG, 'reduce_only': True,
+                            'grid_level': lvl_i, 'position_side': 'LONG',
+                            'placed_at': int(timestamp),
+                            'order_type': 'TAKE_PROFIT_MARKET',
+                        }
+                        long_orders += 1
 
         if long_orders > 0:
             self.trade_logger.log_grid_placement(
@@ -1048,24 +1099,44 @@ class LiveRunner:
 
         # Short TPs as TAKE_PROFIT_MARKET conditional orders
         # Equal-split across grid levels (matches backtest strategy.py)
+        # If per-level qty is below exchange minimum, aggregate into a single TP.
         if self.pos_short.is_open:
+            min_qty = self.executor._min_amount(self.symbol) or 0.01
             tp_qty_per_level = self.pos_short.size / max(grid_levels, 1)
-            for lvl_i, lvl_price in enumerate(buy_levels_s):
-                if tp_qty_per_level < 1e-12 or lvl_price <= 0:
-                    break
-                order = self.executor.place_take_profit(
-                    self.symbol, 'buy', tp_qty_per_level, lvl_price, 'SHORT',
-                    client_order_id=f'grid_S_TP_{lvl_i}_{int(timestamp)}')
-                if order:
-                    actual_qty = float(order.get('amount', tp_qty_per_level))
-                    self.conditional_orders[str(order['id'])] = {
-                        'side': 'buy', 'price': lvl_price, 'qty': actual_qty,
-                        'direction': DIR_SHORT, 'reduce_only': True,
-                        'grid_level': lvl_i, 'position_side': 'SHORT',
-                        'placed_at': int(timestamp),
-                        'order_type': 'TAKE_PROFIT_MARKET',
-                    }
-                    short_orders += 1
+
+            if tp_qty_per_level < min_qty:
+                # Position too small to split — place single TP at first buy level
+                if self.pos_short.size >= min_qty and len(buy_levels_s) > 0:
+                    order = self.executor.place_take_profit(
+                        self.symbol, 'buy', self.pos_short.size, buy_levels_s[0], 'SHORT',
+                        client_order_id=f'grid_S_TP_agg_{int(timestamp)}')
+                    if order:
+                        actual_qty = float(order.get('amount', self.pos_short.size))
+                        self.conditional_orders[str(order['id'])] = {
+                            'side': 'buy', 'price': buy_levels_s[0], 'qty': actual_qty,
+                            'direction': DIR_SHORT, 'reduce_only': True,
+                            'grid_level': 0, 'position_side': 'SHORT',
+                            'placed_at': int(timestamp),
+                            'order_type': 'TAKE_PROFIT_MARKET',
+                        }
+                        short_orders += 1
+            else:
+                for lvl_i, lvl_price in enumerate(buy_levels_s):
+                    if tp_qty_per_level < 1e-12 or lvl_price <= 0:
+                        break
+                    order = self.executor.place_take_profit(
+                        self.symbol, 'buy', tp_qty_per_level, lvl_price, 'SHORT',
+                        client_order_id=f'grid_S_TP_{lvl_i}_{int(timestamp)}')
+                    if order:
+                        actual_qty = float(order.get('amount', tp_qty_per_level))
+                        self.conditional_orders[str(order['id'])] = {
+                            'side': 'buy', 'price': lvl_price, 'qty': actual_qty,
+                            'direction': DIR_SHORT, 'reduce_only': True,
+                            'grid_level': lvl_i, 'position_side': 'SHORT',
+                            'placed_at': int(timestamp),
+                            'order_type': 'TAKE_PROFIT_MARKET',
+                        }
+                        short_orders += 1
 
         if short_orders > 0:
             self.trade_logger.log_grid_placement(

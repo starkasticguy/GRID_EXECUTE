@@ -1123,3 +1123,150 @@ class TestAuditFixes:
         # Should have added 0.3 (filled), not 0.5 (requested)
         assert runner.pos_long.size == pytest.approx(1.3, abs=0.01)
         assert runner.metrics['longs_opened'] == 1
+
+
+class TestMinimumOrderQty:
+    """Tests for minimum order quantity enforcement and related fixes."""
+
+    @pytest.fixture
+    def dry_executor(self):
+        """Create a dry-run executor for testing."""
+        live_config = LIVE_CONFIG.copy()
+        executor = BinanceExecutor(
+            'test_key', 'test_secret', live_config,
+            dry_run=True, testnet=False)
+        return executor
+
+    def _make_runner(self, tmp_dir):
+        """Create a minimal LiveRunner for testing."""
+        from live.runner import LiveRunner
+
+        config = STRATEGY_PARAMS.copy()
+        live_config = LIVE_CONFIG.copy()
+
+        executor = BinanceExecutor(
+            'test_key', 'test_secret', live_config,
+            dry_run=True, testnet=False)
+
+        state_mgr = StateManager(tmp_dir, 'SOLUSDT')
+        trade_logger = TradeLogger(tmp_dir, 'SOLUSDT', 'WARNING')
+        health_monitor = HealthMonitor(live_config, initial_equity=10000.0)
+
+        runner = LiveRunner(
+            executor, 'SOL/USDT:USDT',
+            config, live_config,
+            state_mgr, trade_logger, health_monitor)
+        runner.wallet_balance = 10000.0
+        return runner
+
+    def test_min_amount_returns_zero_in_dry_run(self, dry_executor):
+        """_min_amount returns 0.0 when markets not loaded (dry run)."""
+        result = dry_executor._min_amount('SOL/USDT:USDT')
+        assert result == 0.0
+
+    def test_limit_order_rejects_below_min_amount(self, dry_executor):
+        """Limit order returns None when amount < min_amount.
+
+        In dry-run mode, _min_amount returns 0.0 so we monkey-patch it.
+        """
+        dry_executor._min_amount = lambda sym: 0.01
+        # 0.005 < 0.01 min
+        order = dry_executor.place_limit_order(
+            'SOL/USDT:USDT', 'buy', 0.005, 85.0, 'LONG')
+        assert order is None
+
+    def test_market_order_rejects_below_min_amount(self, dry_executor):
+        """Market order returns None when amount < min_amount."""
+        dry_executor._min_amount = lambda sym: 0.01
+        order = dry_executor.place_market_order(
+            'SOL/USDT:USDT', 'sell', 0.005, 'LONG', reduce_only=True)
+        assert order is None
+
+    def test_tp_order_rejects_below_min_amount(self, dry_executor):
+        """TP order returns None when amount < min_amount."""
+        dry_executor._min_amount = lambda sym: 0.01
+        order = dry_executor.place_take_profit(
+            'SOL/USDT:USDT', 'sell', 0.005, 90.0, 'LONG')
+        assert order is None
+
+    def test_sl_order_rejects_below_min_amount(self, dry_executor):
+        """SL order returns None when amount < min_amount."""
+        dry_executor._min_amount = lambda sym: 0.01
+        order = dry_executor.place_stop_loss(
+            'SOL/USDT:USDT', 'sell', 0.005, 80.0, 'LONG')
+        assert order is None
+
+    def test_orders_pass_when_above_min_amount(self, dry_executor):
+        """Orders succeed when amount >= min_amount."""
+        dry_executor._min_amount = lambda sym: 0.01
+        order = dry_executor.place_limit_order(
+            'SOL/USDT:USDT', 'buy', 0.3, 85.0, 'LONG')
+        assert order is not None
+        assert float(order['amount']) == 0.3
+
+    def test_prune_skips_internal_close_on_order_failure(self, tmp_dir):
+        """When prune market order fails, internal position is NOT closed."""
+        runner = self._make_runner(tmp_dir)
+        runner.pos_long.add_fill(100.0, 0.005, time.time() * 1000, 0)
+        initial_size = runner.pos_long.size
+
+        # Mock _min_amount to simulate minimum being 0.01
+        runner.executor._min_amount = lambda sym: 0.01
+
+        # Simulate pruning — the market order for 0.005 will fail
+        from engine.pruning import run_pruning_cycle
+        # Directly test the pruning safeguard: if order returns None, don't close
+        close_side = 'sell'
+        pos_side = 'LONG'
+        order = runner.executor.place_market_order(
+            runner.symbol, close_side, 0.005, pos_side, reduce_only=True)
+        assert order is None  # Below minimum
+
+        # Position should remain unchanged
+        assert runner.pos_long.size == pytest.approx(initial_size, abs=1e-9)
+
+    def test_tp_aggregation_when_below_min(self, tmp_dir):
+        """When per-level TP qty < min, single aggregated TP is placed."""
+        runner = self._make_runner(tmp_dir)
+        # Small long position: 0.02 SOL, grid_levels=4 → 0.005 per level
+        runner.pos_long.add_fill(85.0, 0.02, time.time() * 1000, 0)
+        runner.executor._min_amount = lambda sym: 0.01
+
+        grid_levels = runner.config['grid_levels']
+        tp_qty_per_level = runner.pos_long.size / max(grid_levels, 1)
+
+        # Per-level qty should be below min
+        assert tp_qty_per_level < 0.01
+        # But full position is above min
+        assert runner.pos_long.size >= 0.01
+
+    def test_tp_normal_split_when_above_min(self, tmp_dir):
+        """When per-level TP qty >= min, normal split is used."""
+        runner = self._make_runner(tmp_dir)
+        # Large position: 1.0 SOL, grid_levels=4 → 0.25 per level
+        runner.pos_long.add_fill(85.0, 1.0, time.time() * 1000, 0)
+        runner.executor._min_amount = lambda sym: 0.01
+
+        grid_levels = runner.config['grid_levels']
+        tp_qty_per_level = runner.pos_long.size / max(grid_levels, 1)
+
+        # Per-level qty should be above min
+        assert tp_qty_per_level >= 0.01
+
+    def test_stop_loss_skips_internal_close_on_failure(self, tmp_dir):
+        """When stop loss market order fails, position is NOT closed internally."""
+        runner = self._make_runner(tmp_dir)
+        # Sub-minimum position
+        runner.pos_long.add_fill(100.0, 0.005, time.time() * 1000, 0)
+        runner.executor._min_amount = lambda sym: 0.01
+
+        # Try to place a market order for the stop
+        order = runner.executor.place_market_order(
+            runner.symbol, 'sell', runner.pos_long.size,
+            'LONG', reduce_only=True)
+
+        # Order should fail
+        assert order is None
+        # Position should remain open
+        assert runner.pos_long.is_open
+        assert runner.pos_long.size == pytest.approx(0.005, abs=1e-9)

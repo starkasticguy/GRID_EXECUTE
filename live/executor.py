@@ -163,6 +163,12 @@ class BinanceExecutor:
         amount = self._amount_precision(symbol, amount)
         price = self._price_precision(symbol, price)
 
+        # Min quantity check (before Binance rejects it)
+        min_amt = self._min_amount(symbol)
+        if min_amt > 0 and amount < min_amt:
+            logger.warning(f"Order amount {amount} below minimum {min_amt} for {symbol}")
+            return None
+
         if amount <= 0 or price <= 0:
             logger.warning(f"Invalid order params: amount={amount}, price={price}")
             return None
@@ -197,6 +203,13 @@ class BinanceExecutor:
                            reduce_only: bool = False) -> Optional[dict]:
         """Place a market order (for stops, prunes, emergency closes)."""
         amount = self._amount_precision(symbol, amount)
+
+        # Min quantity check
+        min_amt = self._min_amount(symbol)
+        if min_amt > 0 and amount < min_amt:
+            logger.warning(f"Market order amount {amount} below minimum {min_amt} for {symbol}")
+            return None
+
         if amount <= 0:
             logger.warning(f"Invalid market order amount: {amount}")
             return None
@@ -228,6 +241,12 @@ class BinanceExecutor:
         """
         amount = self._amount_precision(symbol, amount)
         trigger_price = self._price_precision(symbol, trigger_price)
+
+        # Min quantity check
+        min_amt = self._min_amount(symbol)
+        if min_amt > 0 and amount < min_amt:
+            logger.warning(f"TP amount {amount} below minimum {min_amt} for {symbol}")
+            return None
 
         if amount <= 0 or trigger_price <= 0:
             logger.warning(f"Invalid TP params: amount={amount}, trigger={trigger_price}")
@@ -263,6 +282,12 @@ class BinanceExecutor:
         """
         amount = self._amount_precision(symbol, amount)
         trigger_price = self._price_precision(symbol, trigger_price)
+
+        # Min quantity check
+        min_amt = self._min_amount(symbol)
+        if min_amt > 0 and amount < min_amt:
+            logger.warning(f"SL amount {amount} below minimum {min_amt} for {symbol}")
+            return None
 
         if amount <= 0 or trigger_price <= 0:
             logger.warning(f"Invalid SL params: amount={amount}, trigger={trigger_price}")
@@ -424,6 +449,20 @@ class BinanceExecutor:
             return float(market.get('limits', {}).get('cost', {}).get('min', 5.0) or 5.0)
         except Exception:
             return 5.0
+
+    def _min_amount(self, symbol: str) -> float:
+        """Get minimum order amount (quantity) for symbol.
+
+        For SOL/USDT:USDT this is 0.01, for BTC it's 0.001, etc.
+        Returns 0.0 if markets not loaded (allows all amounts).
+        """
+        if not self._markets_loaded:
+            return 0.0
+        try:
+            market = self.exchange.market(symbol)
+            return float(market.get('limits', {}).get('amount', {}).get('min', 0) or 0)
+        except Exception:
+            return 0.0
 
     # ─── Retry Logic ─────────────────────────────────────────────
 
