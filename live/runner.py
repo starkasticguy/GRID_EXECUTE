@@ -254,6 +254,9 @@ class LiveRunner:
                 # 4. Sync with exchange (detect fills)
                 self._sync_exchange_state()
 
+                # 4a. Check conditional orders (TP/SL) for fills between candles
+                self._sync_conditional_orders()
+
                 # 4b. Refresh wallet balance from exchange
                 # (picks up fills, funding, fees applied by Binance)
                 try:
@@ -455,6 +458,52 @@ class LiveRunner:
         # Reconcile position sizes (exchange is always truth)
         positions_after = self.executor.get_positions(self.symbol)
         self._reconcile_positions(positions_after)
+
+    def _sync_conditional_orders(self):
+        """Check conditional orders (TP/SL) for fills that occurred between candles.
+
+        Unlike regular limit orders which appear in fetch_open_orders(),
+        conditional orders live on a separate Binance API. We must poll
+        each tracked conditional order individually via fetch_conditional_order()
+        to detect fills.
+        """
+        if not self.conditional_orders:
+            return
+
+        filled_ids = []
+
+        for oid, order_info in list(self.conditional_orders.items()):
+            try:
+                order_status = self.executor.fetch_conditional_order(oid, self.symbol)
+                if order_status is None:
+                    continue
+
+                status = order_status.get('status', 'unknown')
+
+                if status == 'closed':
+                    # Conditional order was triggered and filled
+                    fill_price = float(
+                        order_status.get('average', 0) or
+                        order_status.get('price', 0) or
+                        order_info['price'])
+                    logger.info(
+                        f"Conditional order {oid} ({order_info.get('order_type', '?')}) "
+                        f"FILLED @ {fill_price:.4f}")
+                    self._process_live_fill(order_info, fill_price)
+                    filled_ids.append(oid)
+
+                elif status in ('canceled', 'cancelled', 'expired', 'rejected'):
+                    logger.info(f"Conditional order {oid} was {status}, removing from tracking")
+                    filled_ids.append(oid)
+
+                # 'open' status → still waiting, leave in dict
+
+            except Exception as e:
+                logger.warning(f"Error checking conditional order {oid}: {e}")
+
+        # Remove processed orders
+        for oid in filled_ids:
+            del self.conditional_orders[oid]
 
     def _process_live_fill(self, order_info: dict, fill_price: float):
         """Process a detected fill from exchange sync."""

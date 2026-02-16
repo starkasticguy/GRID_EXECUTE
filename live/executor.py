@@ -288,6 +288,26 @@ class BinanceExecutor:
             return order
         return self._retry(_place)
 
+    def fetch_conditional_order(self, order_id: str, symbol: str) -> Optional[dict]:
+        """Fetch status of a conditional (algo) order from Binance.
+
+        Conditional orders (TAKE_PROFIT_MARKET, STOP_MARKET) live on a separate
+        Binance API. Must pass trigger=True so ccxt routes to
+        fapiPrivateGetAlgoOrder instead of fapiPrivateGetOrder.
+
+        Returns parsed order dict or None on failure.
+        """
+        if self.dry_run:
+            return None  # No exchange state in dry-run
+
+        try:
+            order = self.exchange.fetch_order(order_id, symbol,
+                                              params={'trigger': True})
+            return order
+        except Exception as e:
+            logger.warning(f"Failed to fetch conditional order {order_id}: {e}")
+            return None
+
     def cancel_all_orders(self, symbol: str) -> int:
         """Cancel all open orders for a symbol, including conditional (TP/SL).
         Returns 0 on success, -1 on failure."""

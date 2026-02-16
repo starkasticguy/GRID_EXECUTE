@@ -725,3 +725,224 @@ class TestConditionalOrdersState:
         # The loaded state won't have 'conditional_orders' key,
         # but _restore_state() uses .get() with default {}
         assert loaded.get('conditional_orders', {}) == {}
+
+
+# ─── Conditional Order Fill Detection Tests ────────────────────────
+
+class TestConditionalOrderFillDetection:
+    """Tests for _sync_conditional_orders() detecting TP/SL fills between candles."""
+
+    def _make_runner(self, tmp_dir):
+        """Create a minimal LiveRunner for testing (dry-run, no exchange)."""
+        from live.runner import LiveRunner
+
+        config = STRATEGY_PARAMS.copy()
+        live_config = LIVE_CONFIG.copy()
+
+        executor = BinanceExecutor(
+            'test_key', 'test_secret', live_config,
+            dry_run=True, testnet=False)
+
+        state_mgr = StateManager(tmp_dir, 'SOLUSDT')
+        trade_logger = TradeLogger(tmp_dir, 'SOLUSDT', 'WARNING')
+        health_monitor = HealthMonitor(live_config, initial_equity=10000.0)
+
+        runner = LiveRunner(
+            executor, 'SOL/USDT:USDT',
+            config, live_config,
+            state_mgr, trade_logger, health_monitor)
+        runner.wallet_balance = 10000.0
+        return runner
+
+    def test_sync_conditional_empty_dict_noop(self, tmp_dir):
+        """No API calls when conditional_orders is empty."""
+        runner = self._make_runner(tmp_dir)
+        runner.conditional_orders = {}
+        # Should return immediately without error
+        runner._sync_conditional_orders()
+        assert runner.conditional_orders == {}
+
+    def test_sync_conditional_detects_tp_fill(self, tmp_dir):
+        """Filled TP order is detected and processed via _process_live_fill."""
+        runner = self._make_runner(tmp_dir)
+
+        # Set up a long position so TP close works
+        runner.pos_long.add_fill(130.0, 1.0, time.time() * 1000, 0)
+
+        # Track a TP conditional order
+        runner.conditional_orders = {
+            'tp_123': {
+                'side': 'sell', 'price': 135.0, 'qty': 0.5,
+                'direction': 1, 'reduce_only': True,
+                'position_side': 'LONG', 'placed_at': 1000000,
+                'order_type': 'TAKE_PROFIT_MARKET',
+            },
+        }
+
+        # Mock fetch_conditional_order to return 'closed' (filled)
+        runner.executor.fetch_conditional_order = lambda oid, sym: {
+            'status': 'closed',
+            'average': 135.50,
+            'price': 135.0,
+        }
+
+        runner._sync_conditional_orders()
+
+        # TP order should be removed from tracking
+        assert 'tp_123' not in runner.conditional_orders
+        # Long position should have been partially closed
+        assert runner.pos_long.size < 1.0
+        # Metrics should show a long close
+        assert runner.metrics['longs_closed'] == 1
+
+    def test_sync_conditional_detects_sl_fill(self, tmp_dir):
+        """Filled SL order is detected and processed."""
+        runner = self._make_runner(tmp_dir)
+
+        # Set up a short position so SL close works
+        runner.pos_short.add_fill(130.0, 2.0, time.time() * 1000, 0)
+
+        # Track an SL conditional order
+        runner.conditional_orders = {
+            'sl_456': {
+                'side': 'buy', 'price': 135.0, 'qty': 2.0,
+                'direction': -1, 'reduce_only': True,
+                'position_side': 'SHORT', 'placed_at': 1000000,
+                'order_type': 'STOP_MARKET',
+            },
+        }
+
+        # Mock: SL triggered and filled
+        runner.executor.fetch_conditional_order = lambda oid, sym: {
+            'status': 'closed',
+            'average': 135.20,
+            'price': 135.0,
+        }
+
+        runner._sync_conditional_orders()
+
+        assert 'sl_456' not in runner.conditional_orders
+        assert runner.metrics['shorts_closed'] == 1
+
+    def test_sync_conditional_ignores_open_orders(self, tmp_dir):
+        """Open (unfilled) conditional orders stay in tracking dict."""
+        runner = self._make_runner(tmp_dir)
+
+        runner.conditional_orders = {
+            'tp_789': {
+                'side': 'sell', 'price': 140.0, 'qty': 0.3,
+                'direction': 1, 'reduce_only': True,
+                'position_side': 'LONG', 'placed_at': 1000000,
+                'order_type': 'TAKE_PROFIT_MARKET',
+            },
+        }
+
+        # Mock: order still open
+        runner.executor.fetch_conditional_order = lambda oid, sym: {
+            'status': 'open',
+        }
+
+        runner._sync_conditional_orders()
+
+        # Should remain in tracking
+        assert 'tp_789' in runner.conditional_orders
+
+    def test_sync_conditional_removes_cancelled(self, tmp_dir):
+        """Cancelled conditional orders are removed without processing a fill."""
+        runner = self._make_runner(tmp_dir)
+
+        runner.conditional_orders = {
+            'sl_cancel': {
+                'side': 'sell', 'price': 125.0, 'qty': 1.0,
+                'direction': 1, 'reduce_only': True,
+                'position_side': 'LONG', 'placed_at': 1000000,
+                'order_type': 'STOP_MARKET',
+            },
+        }
+
+        # Mock: order was cancelled
+        runner.executor.fetch_conditional_order = lambda oid, sym: {
+            'status': 'canceled',
+        }
+
+        runner._sync_conditional_orders()
+
+        assert 'sl_cancel' not in runner.conditional_orders
+        # No fills should have been processed
+        assert runner.metrics['longs_closed'] == 0
+        assert runner.metrics['shorts_closed'] == 0
+
+    def test_sync_conditional_handles_fetch_failure(self, tmp_dir):
+        """Failed fetch (returns None) leaves order in tracking dict."""
+        runner = self._make_runner(tmp_dir)
+
+        runner.conditional_orders = {
+            'tp_fail': {
+                'side': 'sell', 'price': 140.0, 'qty': 0.5,
+                'direction': 1, 'reduce_only': True,
+                'position_side': 'LONG', 'placed_at': 1000000,
+                'order_type': 'TAKE_PROFIT_MARKET',
+            },
+        }
+
+        # Mock: fetch returns None (network failure, etc.)
+        runner.executor.fetch_conditional_order = lambda oid, sym: None
+
+        runner._sync_conditional_orders()
+
+        # Order should remain — we'll retry next cycle
+        assert 'tp_fail' in runner.conditional_orders
+
+    def test_sync_conditional_multiple_orders_mixed_status(self, tmp_dir):
+        """Multiple conditional orders with different statuses handled correctly."""
+        runner = self._make_runner(tmp_dir)
+
+        # Set up positions
+        runner.pos_long.add_fill(130.0, 2.0, time.time() * 1000, 0)
+        runner.pos_short.add_fill(140.0, 1.0, time.time() * 1000, 0)
+
+        runner.conditional_orders = {
+            'tp_filled': {
+                'side': 'sell', 'price': 135.0, 'qty': 0.5,
+                'direction': 1, 'reduce_only': True,
+                'position_side': 'LONG', 'placed_at': 1000000,
+                'order_type': 'TAKE_PROFIT_MARKET',
+            },
+            'sl_open': {
+                'side': 'sell', 'price': 125.0, 'qty': 1.0,
+                'direction': 1, 'reduce_only': True,
+                'position_side': 'LONG', 'placed_at': 1000000,
+                'order_type': 'STOP_MARKET',
+            },
+            'tp_cancelled': {
+                'side': 'buy', 'price': 135.0, 'qty': 0.5,
+                'direction': -1, 'reduce_only': True,
+                'position_side': 'SHORT', 'placed_at': 1000000,
+                'order_type': 'TAKE_PROFIT_MARKET',
+            },
+        }
+
+        # Mock: different status per order
+        def mock_fetch(oid, sym):
+            if oid == 'tp_filled':
+                return {'status': 'closed', 'average': 135.50}
+            elif oid == 'sl_open':
+                return {'status': 'open'}
+            elif oid == 'tp_cancelled':
+                return {'status': 'expired'}
+            return None
+
+        runner.executor.fetch_conditional_order = mock_fetch
+
+        runner._sync_conditional_orders()
+
+        # tp_filled → removed (processed)
+        assert 'tp_filled' not in runner.conditional_orders
+        # sl_open → stays
+        assert 'sl_open' in runner.conditional_orders
+        # tp_cancelled → removed (expired, no fill)
+        assert 'tp_cancelled' not in runner.conditional_orders
+
+        # Only the filled TP should have incremented metrics
+        assert runner.metrics['longs_closed'] == 1
+        assert runner.metrics['shorts_closed'] == 0
