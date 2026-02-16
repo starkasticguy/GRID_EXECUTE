@@ -296,24 +296,18 @@ class BinanceExecutor:
             return 0
 
         try:
-            # Cancel regular limit orders
+            # 1. Cancel regular limit orders
+            #    Routes to: fapiPrivateDeleteAllOpenOrders
             self.exchange.cancel_all_orders(symbol)
 
-            # Also cancel conditional/algo orders (STOP_MARKET, TAKE_PROFIT_MARKET)
-            # These may be on a separate endpoint on Binance Futures
+            # 2. Cancel conditional/algo orders (STOP_MARKET, TAKE_PROFIT_MARKET)
+            #    Must pass trigger=True so ccxt routes to fapiPrivateDeleteAlgoOpenOrders
+            #    (separate Binance endpoint — regular cancel does NOT touch these)
             try:
-                open_orders = self.exchange.fetch_open_orders(symbol)
-                for o in open_orders:
-                    otype = (o.get('type') or '').upper()
-                    if otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET',
-                                 'STOP', 'TAKE_PROFIT'):
-                        try:
-                            self.exchange.cancel_order(o['id'], symbol)
-                            logger.info(f"Cancelled conditional order {o['id']} ({otype})")
-                        except Exception:
-                            pass  # Best-effort
-            except Exception:
-                pass  # If we can't fetch, the first cancel_all likely got them
+                self.exchange.cancel_all_orders(symbol, params={'trigger': True})
+                logger.info(f"Cancelled conditional orders for {symbol}")
+            except Exception as e:
+                logger.warning(f"Failed to cancel conditional orders: {e}")
 
             orders = self.get_open_orders(symbol)
             remaining = len(orders)
