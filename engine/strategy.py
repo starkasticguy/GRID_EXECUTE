@@ -380,6 +380,7 @@ class GridStrategyV4:
                     self.order_book.add_order(
                         SIDE_BUY, lvl_price, qty, timestamp,
                         lvl_i, DIR_LONG)
+                    current_notional += qty * lvl_price
 
         # Place long grid sell orders (take-profit on existing longs)
         if self.pos_long.is_open:
@@ -417,6 +418,7 @@ class GridStrategyV4:
                         self.order_book.add_order(
                             SIDE_SELL, lvl_price, qty, timestamp,
                             lvl_i, DIR_SHORT)
+                        current_notional += qty * lvl_price
 
             # Short grid buy orders (take-profit on existing shorts)
             if self.pos_short.is_open:

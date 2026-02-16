@@ -251,13 +251,22 @@ class LiveRunner:
                     logger.warning("Indicator computation failed, skipping bar")
                     continue
 
-                # 4. Sync with exchange (detect fills)
+                # 4. Sync with exchange (detect limit order fills)
                 self._sync_exchange_state()
 
                 # 4a. Check conditional orders (TP/SL) for fills between candles
                 self._sync_conditional_orders()
 
-                # 4b. Refresh wallet balance from exchange
+                # 4b. Reconcile positions with exchange (catch anything missed)
+                # Runs AFTER both sync methods so properly detected fills
+                # aren't double-processed by the blunt reconciliation.
+                try:
+                    positions = self.executor.get_positions(self.symbol)
+                    self._reconcile_positions(positions)
+                except Exception as e:
+                    logger.warning(f"Position reconciliation failed: {e}")
+
+                # 4c. Refresh wallet balance from exchange
                 # (picks up fills, funding, fees applied by Binance)
                 try:
                     balance = self.executor.get_balance()
@@ -438,12 +447,19 @@ class LiveRunner:
                 order_status = self.executor.exchange.fetch_order(oid, self.symbol)
                 status = order_status.get('status', 'unknown')
                 if status in ('closed',):
-                    # Order was filled
+                    # Order was filled — use actual filled qty (not requested)
+                    # to handle partial fills correctly
                     fill_price = float(order_status.get('average', 0) or
                                        order_status.get('price', 0) or
                                        order_info['price'])
-                    logger.info(f"Order {oid} FILLED @ {fill_price:.2f}")
-                    self._process_live_fill(order_info, fill_price)
+                    filled_qty = float(order_status.get('filled',
+                                                         order_info['qty']))
+                    if filled_qty > 1e-12:
+                        fill_info = order_info.copy()
+                        fill_info['qty'] = filled_qty
+                        logger.info(f"Order {oid} FILLED @ {fill_price:.2f} "
+                                    f"qty={filled_qty}")
+                        self._process_live_fill(fill_info, fill_price)
                 elif status in ('canceled', 'cancelled', 'expired', 'rejected'):
                     logger.info(f"Order {oid} was {status}, not a fill")
                 else:
@@ -454,10 +470,6 @@ class LiveRunner:
                                f"Inferring from position change.")
                 # Conservative: skip and let reconciliation handle it
             del self.active_orders[oid]
-
-        # Reconcile position sizes (exchange is always truth)
-        positions_after = self.executor.get_positions(self.symbol)
-        self._reconcile_positions(positions_after)
 
     def _sync_conditional_orders(self):
         """Check conditional orders (TP/SL) for fills that occurred between candles.
@@ -482,14 +494,20 @@ class LiveRunner:
 
                 if status == 'closed':
                     # Conditional order was triggered and filled
+                    # Use actual filled qty (not requested) for partial fills
                     fill_price = float(
                         order_status.get('average', 0) or
                         order_status.get('price', 0) or
                         order_info['price'])
-                    logger.info(
-                        f"Conditional order {oid} ({order_info.get('order_type', '?')}) "
-                        f"FILLED @ {fill_price:.4f}")
-                    self._process_live_fill(order_info, fill_price)
+                    filled_qty = float(order_status.get('filled',
+                                                         order_info['qty']))
+                    if filled_qty > 1e-12:
+                        fill_info = order_info.copy()
+                        fill_info['qty'] = filled_qty
+                        logger.info(
+                            f"Conditional order {oid} ({order_info.get('order_type', '?')}) "
+                            f"FILLED @ {fill_price:.4f} qty={filled_qty}")
+                        self._process_live_fill(fill_info, fill_price)
                     filled_ids.append(oid)
 
                 elif status in ('canceled', 'cancelled', 'expired', 'rejected'):
@@ -751,8 +769,9 @@ class LiveRunner:
             prev_atr, spacing_k, spacing_floor, cur_close)
         grid_profit_potential = grid_spacing * order_pct * self.wallet_balance / max(cur_close, 1)
 
-        # Use current system time for pruning age checks (in ms to match fill timestamps)
-        prune_time = time.time() * 1000
+        # Use candle timestamp for pruning age checks (matches backtest behavior).
+        # Wall-clock time would cause fills to age slightly faster than in backtest.
+        prune_time = cur_time
 
         for pos, acc_profit, side_key in [
             (self.pos_long, self.accumulated_profit_long, 'long'),
@@ -953,22 +972,21 @@ class LiveRunner:
                         'grid_level': lvl_i, 'position_side': 'LONG',
                         'placed_at': int(timestamp),
                     }
+                    current_notional += actual_qty * lvl_price
                     long_orders += 1
 
         # Place long TPs as TAKE_PROFIT_MARKET conditional orders
+        # Equal-split across grid levels (matches backtest strategy.py)
         if self.pos_long.is_open:
-            remaining_long = self.pos_long.size
+            tp_qty_per_level = self.pos_long.size / max(grid_levels, 1)
             for lvl_i, lvl_price in enumerate(sell_levels):
-                tp_qty = min(
-                    calculate_order_qty(self.wallet_balance, lvl_price, order_pct, leverage),
-                    remaining_long)
-                if tp_qty < 1e-12:
+                if tp_qty_per_level < 1e-12:
                     break
                 order = self.executor.place_take_profit(
-                    self.symbol, 'sell', tp_qty, lvl_price, 'LONG',
+                    self.symbol, 'sell', tp_qty_per_level, lvl_price, 'LONG',
                     client_order_id=f'grid_L_TP_{lvl_i}_{int(timestamp)}')
                 if order:
-                    actual_qty = float(order.get('amount', tp_qty))
+                    actual_qty = float(order.get('amount', tp_qty_per_level))
                     self.conditional_orders[str(order['id'])] = {
                         'side': 'sell', 'price': lvl_price, 'qty': actual_qty,
                         'direction': DIR_LONG, 'reduce_only': True,
@@ -976,7 +994,6 @@ class LiveRunner:
                         'placed_at': int(timestamp),
                         'order_type': 'TAKE_PROFIT_MARKET',
                     }
-                    remaining_long -= actual_qty
                     long_orders += 1
 
         if long_orders > 0:
@@ -1026,24 +1043,21 @@ class LiveRunner:
                         'grid_level': lvl_i, 'position_side': 'SHORT',
                         'placed_at': int(timestamp),
                     }
+                    current_notional += actual_qty * lvl_price
                     short_orders += 1
 
         # Short TPs as TAKE_PROFIT_MARKET conditional orders
+        # Equal-split across grid levels (matches backtest strategy.py)
         if self.pos_short.is_open:
-            remaining_short = self.pos_short.size
+            tp_qty_per_level = self.pos_short.size / max(grid_levels, 1)
             for lvl_i, lvl_price in enumerate(buy_levels_s):
-                if lvl_price <= 0:
-                    break
-                tp_qty = min(
-                    calculate_order_qty(self.wallet_balance, lvl_price, order_pct, leverage),
-                    remaining_short)
-                if tp_qty < 1e-12:
+                if tp_qty_per_level < 1e-12 or lvl_price <= 0:
                     break
                 order = self.executor.place_take_profit(
-                    self.symbol, 'buy', tp_qty, lvl_price, 'SHORT',
+                    self.symbol, 'buy', tp_qty_per_level, lvl_price, 'SHORT',
                     client_order_id=f'grid_S_TP_{lvl_i}_{int(timestamp)}')
                 if order:
-                    actual_qty = float(order.get('amount', tp_qty))
+                    actual_qty = float(order.get('amount', tp_qty_per_level))
                     self.conditional_orders[str(order['id'])] = {
                         'side': 'buy', 'price': lvl_price, 'qty': actual_qty,
                         'direction': DIR_SHORT, 'reduce_only': True,
@@ -1051,7 +1065,6 @@ class LiveRunner:
                         'placed_at': int(timestamp),
                         'order_type': 'TAKE_PROFIT_MARKET',
                     }
-                    remaining_short -= actual_qty
                     short_orders += 1
 
         if short_orders > 0:
