@@ -6,7 +6,7 @@ All parameters for the hedge-mode grid trading engine.
 
 STRATEGY_PARAMS = {
     # ─── Signal (KAMA/ER Regime Detection) ────────────────────
-    'kama_period': 29,              # ER lookback (150 min on 15m)
+    'kama_period': 15,              # ER lookback (150 min on 15m)
     'kama_fast': 2,                 # Fast EMA period for KAMA
     'kama_slow': 30,                # Slow EMA period for KAMA
     'atr_period': 14,               # ATR lookback
@@ -110,7 +110,6 @@ BACKTEST_FILL_CONF = {
 # ─── Optimizer Parameter Space ────────────────────────────────
 # Used by optimizer.py for Bayesian/GA search
 OPTIMIZER_SPACE = {
-    'kama_period':      {'type': 'int',   'low': 5,    'high': 30},
     'grid_spacing_k':   {'type': 'float', 'low': 0.5,  'high': 3.0},
     'grid_levels':      {'type': 'int',   'low': 3,    'high': 20},
     'gamma':            {'type': 'float', 'low': 0.1,  'high': 2.0},
