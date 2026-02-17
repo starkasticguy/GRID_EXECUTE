@@ -18,7 +18,7 @@ import pandas as pd
 import argparse
 import json
 import os
-from config import STRATEGY_PARAMS, BACKTEST_CONFIG, OPTIMIZER_SPACE
+from config import STRATEGY_PARAMS, BACKTEST_CONFIG, OPTIMIZER_SPACE, BACKTEST_FILL_CONF
 from backtest.data_fetcher import fetch_data
 from engine.strategy import GridStrategyV4
 
@@ -203,6 +203,9 @@ def main():
           f"({args.windows} walk-forward windows)...")
     print(f"Fitness: Walk-Forward Calmar Ratio (OOS)")
     print(f"Anti-overfit: WFO + multi-coin avg + stability penalty\n")
+
+    print(f"  Simulation: Slippage {BACKTEST_FILL_CONF.get('slippage_pct', 0)*100:.2f}% | "
+          f"Fill Prob {BACKTEST_FILL_CONF.get('fill_probability', 1)*100:.0f}%\n")
 
     # Suppress Optuna logging
     optuna.logging.set_verbosity(optuna.logging.WARNING)

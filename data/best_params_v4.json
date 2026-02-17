@@ -1,15 +1,15 @@
 {
     "kama_period": 29,
-    "grid_spacing_k": 0.5000844670481057,
-    "grid_levels": 4,
-    "gamma": 0.8073486673188088,
-    "kappa": 2.1396980608779472,
-    "order_pct": 0.04999719568696284,
-    "atr_sl_mult": 3.3285830660169395,
-    "regime_threshold": 0.2940875104844324,
-    "er_trend_threshold": 0.6248712121898943,
+    "grid_spacing_k": 0.5006433214851668,
+    "grid_levels": 5,
+    "gamma": 0.7795422593625644,
+    "kappa": 2.1812193130861837,
+    "order_pct": 0.048511200600891605,
+    "atr_sl_mult": 3.3088183332918164,
+    "regime_threshold": 0.28486526741012613,
+    "er_trend_threshold": 0.6125762812904754,
     "trailing_enabled": true,
     "allow_short": true,
-    "max_position_age_hours": 9,
-    "deviance_sigma": 4.679956065163205
+    "max_position_age_hours": 10,
+    "deviance_sigma": 3.3870337592649364
 }

@@ -8,6 +8,7 @@ Conservative fill model:
 No partial fills, no slippage model in matching (slippage applied at execution).
 """
 from engine.types import STATUS_OPEN, STATUS_FILLED, STATUS_CANCELLED
+import random
 
 
 class OrderBook:
@@ -52,13 +53,19 @@ class OrderBook:
         self.orders.append(order)
         return order
 
-    def check_fills(self, high: float, low: float) -> list:
+    def check_fills(self, high: float, low: float, fill_prob: float = 1.0) -> list:
         """
         Check which open orders would fill given the candle's H/L range.
 
         Conservative assumption:
           - Buy limit fills if Low <= order price
           - Sell limit fills if High >= order price
+        
+        Args:
+            high: Candle High
+            low: Candle Low
+            fill_prob: Probability [0.0, 1.0] of filling if price touches.
+                       Simulates liquidity/queue position.
 
         Returns list of filled order dicts.
         """
@@ -73,10 +80,12 @@ class OrderBook:
             is_fill = False
             if order['side'] == 1:  # Buy
                 if low <= order['price']:
-                    is_fill = True
+                    if random.random() < fill_prob:
+                        is_fill = True
             elif order['side'] == -1:  # Sell
                 if high >= order['price']:
-                    is_fill = True
+                    if random.random() < fill_prob:
+                        is_fill = True
 
             if is_fill:
                 order['status'] = STATUS_FILLED

@@ -42,6 +42,7 @@ from engine.types import (
 )
 from engine.matching import OrderBook
 from engine.pruning import run_pruning_cycle
+from config import BACKTEST_FILL_CONF
 
 
 class GridStrategyV4:
@@ -169,6 +170,10 @@ class GridStrategyV4:
 
         max_dd_pct = self.config.get('max_drawdown_pct', 0.15)
 
+        # Simulation params
+        slippage = BACKTEST_FILL_CONF.get('slippage_pct', 0.0005)
+        fill_prob = BACKTEST_FILL_CONF.get('fill_probability', 1.0)
+
         # Track accumulated grid profit for profit-offset pruning
         accumulated_profit_long = 0.0
         accumulated_profit_short = 0.0
@@ -217,11 +222,11 @@ class GridStrategyV4:
             # ─── 3. STOP LOSS (ATR-based) ─────────────────────
             stop_trades = self._check_stop_loss(
                 cur_close, cur_low, cur_high, cur_time, i,
-                prev_kama, prev_atr, atr_sl_mult, fee_rate, prev_regime)
+                prev_kama, prev_atr, atr_sl_mult, fee_rate, prev_regime, slippage)
             trades.extend(stop_trades)
 
             # ─── 4. LIQUIDATION CHECK ─────────────────────────
-            liq_trades = self._check_liquidation(cur_close, cur_time, i, fee_rate, prev_regime)
+            liq_trades = self._check_liquidation(cur_close, cur_time, i, fee_rate, prev_regime, slippage)
             trades.extend(liq_trades)
 
             # ─── 5. PRUNING (5 methods, both sides) ──────────
@@ -241,14 +246,21 @@ class GridStrategyV4:
                     anchor, grid_spacing, grid_profit_potential,
                     acc_profit, self.config)
                 if prune_idx >= 0:
-                    fee = abs(pos.fills[prune_idx]['qty']) * cur_close * fee_rate
-                    pnl = pos.close_specific_fill(prune_idx, cur_close, fee)
+                    # Apply slippage to prune market limit
+                    exit_price = cur_close
+                    if pos.side == 1:  # Long close (sell)
+                        exit_price = cur_close * (1 - slippage)
+                    else:              # Short close (buy)
+                        exit_price = cur_close * (1 + slippage)
+
+                    fee = abs(pos.fills[prune_idx]['qty']) * exit_price * fee_rate
+                    pnl = pos.close_specific_fill(prune_idx, exit_price, fee)
                     self.wallet_balance += pnl
                     self.metrics['prune_count'] += 1
                     self.metrics['prune_types'][prune_label] = \
                         self.metrics['prune_types'].get(prune_label, 0) + 1
                     trades.append(self._trade_record(
-                        i, cur_time, cur_close,
+                        i, cur_time, exit_price,
                         pos.fills[prune_idx]['qty'] if prune_idx < len(pos.fills) else 0,
                         prune_label, prev_regime, pnl=pnl))
 
@@ -282,7 +294,7 @@ class GridStrategyV4:
                 self.grid_needs_regen = False
 
             # ─── 9. CHECK FILLS ───────────────────────────────
-            filled_orders = self.order_book.check_fills(cur_high, cur_low)
+            filled_orders = self.order_book.check_fills(cur_high, cur_low, fill_prob)
             for order in filled_orders:
                 fill_trades = self._process_fill(
                     order, cur_close, cur_time, i, fee_rate, prev_regime)
@@ -481,7 +493,7 @@ class GridStrategyV4:
     # ─── STOP LOSS ────────────────────────────────────────────────
 
     def _check_stop_loss(self, price, low, high, timestamp, bar_idx,
-                         kama, atr, sl_mult, fee_rate, regime) -> list:
+                         kama, atr, sl_mult, fee_rate, regime, slippage=0.0) -> list:
         """ATR-based stop loss for both sides."""
         trades = []
 
@@ -489,7 +501,7 @@ class GridStrategyV4:
         if self.pos_long.is_open:
             stop_price = self.pos_long.avg_entry - sl_mult * atr
             if low <= stop_price:
-                exit_price = stop_price  # Fill at stop level
+                exit_price = stop_price * (1 - slippage)  # Apply slippage
                 fee = self.pos_long.size * exit_price * fee_rate
                 pnl = self.pos_long.close_all(exit_price, fee)
                 self.wallet_balance += pnl
@@ -503,7 +515,7 @@ class GridStrategyV4:
         if self.pos_short.is_open:
             stop_price = self.pos_short.avg_entry + sl_mult * atr
             if high >= stop_price:
-                exit_price = stop_price
+                exit_price = stop_price * (1 + slippage)  # Apply slippage
                 fee = self.pos_short.size * exit_price * fee_rate
                 pnl = self.pos_short.close_all(exit_price, fee)
                 self.wallet_balance += pnl
@@ -517,7 +529,7 @@ class GridStrategyV4:
 
     # ─── LIQUIDATION ──────────────────────────────────────────────
 
-    def _check_liquidation(self, price, timestamp, bar_idx, fee_rate, regime) -> list:
+    def _check_liquidation(self, price, timestamp, bar_idx, fee_rate, regime, slippage=0.0) -> list:
         """Check if either position would be liquidated."""
         trades = []
         leverage = self.config.get('leverage', 1.0)
@@ -527,7 +539,8 @@ class GridStrategyV4:
                 self.pos_long.avg_entry, self.pos_long.size,
                 self.wallet_balance, 1, leverage)
             if price <= liq_price and liq_price > 0:
-                pnl = self.pos_long.close_all(price, 0)
+                exit_price = price * (1 - slippage)
+                pnl = self.pos_long.close_all(exit_price, 0)
                 self.wallet_balance += pnl
                 self.metrics['liquidations'] += 1
                 trades.append(self._trade_record(
@@ -540,7 +553,8 @@ class GridStrategyV4:
                 self.pos_short.avg_entry, self.pos_short.size,
                 self.wallet_balance, -1, leverage)
             if price >= liq_price and liq_price > 0:
-                pnl = self.pos_short.close_all(price, 0)
+                exit_price = price * (1 + slippage)
+                pnl = self.pos_short.close_all(exit_price, 0)
                 self.wallet_balance += pnl
                 self.metrics['liquidations'] += 1
                 trades.append(self._trade_record(

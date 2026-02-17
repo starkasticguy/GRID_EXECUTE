@@ -21,7 +21,7 @@ STRATEGY_PARAMS = {
     'order_pct': 0.04999719568696284,              # Order size as % of capital
 
     # ─── Inventory (Avellaneda-Stoikov) ───────────────────────
-    'gamma': 0.8073486673188088,                   # Risk aversion (0.1-2.0)
+    'gamma': 1.0,                   # Risk aversion (0.1-2.0)
     'kappa': 2.1396980608779472,                   # Fill probability parameter
     'skew_factor': 1.5,             # Legacy skew multiplier
     'max_inventory_per_side': 10,   # Max fills per direction
@@ -53,7 +53,7 @@ STRATEGY_PARAMS = {
     'funding_threshold': 0.0003,    # 0.03% adverse funding trigger
 
     # ─── Execution ────────────────────────────────────────────
-    'initial_capital': 10000.0,
+    'initial_capital': 300,
     'fee_maker': -0.00005,          # -0.005% maker rebate
     'fee_taker': 0.0002,            # 0.02% taker fee
     'slippage': 0.0005,             # 0.05% per side
@@ -99,6 +99,12 @@ BACKTEST_CONFIG = {
     'start_date': '2024-01-01',
     'end_date': None,               # None = current date
     'timeframe': '15m',
+}
+
+# ─── Backtest Simulation Settings ─────────────────────────────
+BACKTEST_FILL_CONF = {
+    'slippage_pct': 0.0005,        # 0.05% slippage on market orders
+    'fill_probability': 0.9,       # 90% chance of limit fill if touched
 }
 
 # ─── Optimizer Parameter Space ────────────────────────────────
