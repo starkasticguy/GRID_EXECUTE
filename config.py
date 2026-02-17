@@ -6,7 +6,7 @@ All parameters for the hedge-mode grid trading engine.
 
 STRATEGY_PARAMS = {
     # ─── Signal (KAMA/ER Regime Detection) ────────────────────
-    'kama_period': 15,              # ER lookback (150 min on 15m)
+    'kama_period': 10,              # ER lookback (150 min on 15m)
     'kama_fast': 2,                 # Fast EMA period for KAMA
     'kama_slow': 30,                # Slow EMA period for KAMA
     'atr_period': 14,               # ATR lookback
