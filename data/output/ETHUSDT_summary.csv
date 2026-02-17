@@ -1,2 +1,2 @@
 total_return_pct,buy_hold_return_pct,max_drawdown_pct,sharpe_ratio,sortino_ratio,calmar_ratio,win_rate_pct,profit_factor,gross_profit,gross_loss,total_trades,final_capital,funding_pnl,longs_opened,longs_closed,shorts_opened,shorts_closed,stops_long,stops_short,prune_count,prune_types,circuit_breaker_triggers,trailing_shifts,var_blocks,liquidations
-8.46,1.29,0.77,26.899,162.732,10.941,59.6,4.343,16.8,3.87,52,325.38,0.022106965091220787,14,15,23,12,0,0,30,"{'PRUNE_OFFSET': 21, 'PRUNE_GAP': 9}",0,0,0,0
+120.34,-19.05,2.58,10.278,58.679,46.61,55.3,2.051,373.02,181.91,882,661.03,-0.10012396422594982,275,200,295,230,0,2,516,"{'PRUNE_OFFSET': 359, 'PRUNE_GAP': 156, 'PRUNE_OLDEST': 1}",10,3,0,0

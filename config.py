@@ -10,8 +10,8 @@ STRATEGY_PARAMS = {
     'kama_fast': 2,                 # Fast EMA period for KAMA
     'kama_slow': 30,                # Slow EMA period for KAMA
     'atr_period': 14,               # ATR lookback
-    'regime_threshold': 0.2940875104844324,       # θ for KAMA slope FSM
-    'er_trend_threshold': 0.6248712121898943,      # ER above this = trend regime
+    'regime_threshold': 0.15,       # θ for KAMA slope FSM
+    'er_trend_threshold': 0.5,      # ER above this = trend regime
 
     # ─── Grid ─────────────────────────────────────────────────
     'grid_spacing_k': 0.5000844670481057,          # δ = k × ATR
@@ -21,8 +21,8 @@ STRATEGY_PARAMS = {
     'order_pct': 0.04999719568696284,              # Order size as % of capital
 
     # ─── Inventory (Avellaneda-Stoikov) ───────────────────────
-    'gamma': 1.0,                   # Risk aversion (0.1-2.0)
-    'kappa': 2.1396980608779472,                   # Fill probability parameter
+    'gamma': 0.8,                   # Risk aversion (0.1-2.0)
+    'kappa': 2.3,            # Fill probability parameter
     'skew_factor': 1.5,             # Legacy skew multiplier
     'max_inventory_per_side': 10,   # Max fills per direction
 
