@@ -1,19 +1,32 @@
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
-data/live_state/
-
-# Mac files
-.DS_Store
+*.pyd
 
 # Virtual environments
 venv/
+.venv/
 .env/
+
+# Environment / secrets — NEVER commit API keys
+.env
+
+# Claude internal worktrees — never commit
+.claude/
+
+# Runtime data — large, regenerable, not needed on server
+data/cache/
+data/output/
+data/charts/
+data/live_logs/
+
+# Live state is intentionally tracked so server can resume after git pull
+# data/live_state/ is NOT ignored
+
+# Mac
+.DS_Store
 
 # Logs
 *.log
-
-# Git
-.git/
 
