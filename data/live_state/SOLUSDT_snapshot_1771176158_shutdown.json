@@ -1,0 +1,51 @@
+{
+  "version": "v4.0",
+  "symbol": "SOL/USDT:USDT",
+  "timestamp": 1771176158735,
+  "datetime": "2026-02-15T17:22:38.735640+00:00",
+  "wallet_balance": 100.049637,
+  "initial_capital": 100.02962956,
+  "pos_long": {
+    "size": 0.0,
+    "avg_entry": 0.0,
+    "realized_pnl": 0.0,
+    "unrealized_pnl": 0.0,
+    "funding_pnl": 0.0,
+    "num_fills": 0,
+    "fills": []
+  },
+  "pos_short": {
+    "size": 0.0,
+    "avg_entry": 0.0,
+    "realized_pnl": 0.0,
+    "unrealized_pnl": 0.0,
+    "funding_pnl": 0.0,
+    "num_fills": 0,
+    "fills": []
+  },
+  "halted": false,
+  "grid_anchor_long": 87.48,
+  "grid_anchor_short": 87.48,
+  "trailing_anchor": 87.42,
+  "grid_needs_regen": false,
+  "accumulated_profit_long": 0.0,
+  "accumulated_profit_short": 0.0,
+  "bar_count": 3,
+  "last_processed_bar_ts": 1771174800000,
+  "active_orders": {},
+  "metrics": {
+    "longs_opened": 0,
+    "longs_closed": 0,
+    "shorts_opened": 0,
+    "shorts_closed": 0,
+    "stops_long": 0,
+    "stops_short": 0,
+    "prune_count": 0,
+    "prune_types": {},
+    "circuit_breaker_triggers": 0,
+    "trailing_shifts": 0,
+    "funding_pnl": 0.0,
+    "var_blocks": 0,
+    "liquidations": 0
+  }
+}

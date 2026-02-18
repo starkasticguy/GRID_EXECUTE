@@ -14,7 +14,7 @@ STRATEGY_PARAMS = {
     'er_trend_threshold': 0.5,      # ER above this = trend regime
 
     # ─── Grid ─────────────────────────────────────────────────
-    'grid_spacing_k': 0.8,          # δ = k × ATR (wider = more profit per fill)
+    'grid_spacing_k': 0.4,          # δ = k × ATR (wider = more profit per fill)
     'grid_levels': 4,               # Levels per side (less exposure per cycle)
     'max_orders': 500,              # Max simultaneous orders
     'spacing_floor': 0.004,         # Min spacing (0.4% of price)

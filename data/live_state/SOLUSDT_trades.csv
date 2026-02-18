@@ -1,0 +1,2 @@
+timestamp,datetime,symbol,price,qty,label,regime,pnl,exchange_order_id,fill_price,fee,wallet_balance_after,equity_after,pos_long_size,pos_short_size
+1771171206174,2026-02-15T16:00:06.175011+00:00,SOL/USDT:USDT,87.39,1.1441686619103848,SELL_OPEN_SHORT,0,0.0,,87.39,0.019997779872869707,99.98000222012713,99.98000222012713,0.0,1.1441686619103848
