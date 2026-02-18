@@ -2,6 +2,8 @@
 Description=GRID Trading Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -19,8 +21,6 @@ TimeoutStopSec=30
 # Restart on crash, but not on clean exit (e.g. circuit breaker halt)
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=3
 
 # Logging
 StandardOutput=journal
