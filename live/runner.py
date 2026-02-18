@@ -204,7 +204,7 @@ class LiveRunner:
         self.grid_anchor_long = saved.get('grid_anchor_long', 0.0)
         self.grid_anchor_short = saved.get('grid_anchor_short', 0.0)
         self.trailing_anchor = saved.get('trailing_anchor', 0.0)
-        self.grid_needs_regen = saved.get('grid_needs_regen', True)
+        self.grid_needs_regen = True  # Always regenerate grid on restart
         self.accumulated_profit_long = saved.get('accumulated_profit_long', 0.0)
         self.accumulated_profit_short = saved.get('accumulated_profit_short', 0.0)
         self.bar_count = saved.get('bar_count', 0)
