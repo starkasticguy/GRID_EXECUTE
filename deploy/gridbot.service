@@ -12,7 +12,7 @@ WorkingDirectory=/root/GRID_EXECUTE
 EnvironmentFile=/root/GRID_EXECUTE/.env
 
 # --resume so it picks up existing positions on restart
-ExecStart=/usr/bin/python3 live_trade.py --coin ETH --leverage 3 --resume
+ExecStart=/root/GRID_EXECUTE/venv/bin/python3 live_trade.py --coin ETH --leverage 3 --resume
 
 # Graceful shutdown: SIGTERM → runner.shutdown() → positions left open
 KillSignal=SIGTERM

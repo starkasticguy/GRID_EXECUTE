@@ -79,8 +79,9 @@ cd $REPO_DIR
 git fetch origin
 git reset --hard origin/$BRANCH
 
-echo "[server] Installing dependencies..."
-pip install -q -r requirements.txt
+echo "[server] Installing dependencies into venv..."
+python3 -m venv venv
+venv/bin/pip install -q -r requirements.txt
 
 echo "[server] Snapshotting live state (backup)..."
 SNAP_DIR="data/live_state/snapshots_deploy"
