@@ -151,7 +151,9 @@ class GridStrategyV4:
 
         leverage = self.config.get('leverage', 1.0)
         allow_short = self.config.get('allow_short', True)
-        fee_rate = self.config['fee_taker']
+        fee_maker = self.config.get('fee_maker', 0.0002)   # limit entries
+        fee_taker = self.config.get('fee_taker', 0.0005)   # market exits
+        fee_rate = fee_taker  # default for stops/prunes/liquidation
         order_pct = self.config['order_pct']
         grid_levels = self.config['grid_levels']
         gamma = self.config['gamma']
@@ -297,7 +299,7 @@ class GridStrategyV4:
             filled_orders = self.order_book.check_fills(cur_high, cur_low, fill_prob)
             for order in filled_orders:
                 fill_trades = self._process_fill(
-                    order, cur_close, cur_time, i, fee_rate, prev_regime)
+                    order, cur_close, cur_time, i, fee_maker, fee_taker, prev_regime)
                 trades.extend(fill_trades)
 
                 # Track profit for offset pruning
@@ -445,11 +447,19 @@ class GridStrategyV4:
     # ─── FILL PROCESSING ──────────────────────────────────────────
 
     def _process_fill(self, order, current_price, timestamp, bar_idx,
-                      fee_rate, regime) -> list:
-        """Process a filled order. Returns list of trade records."""
+                      fee_maker, fee_taker, regime) -> list:
+        """Process a filled order. Returns list of trade records.
+
+        Limit grid entries pay maker fee; reduce_only closes (TPs) pay taker fee.
+        This matches live Binance behaviour where entries are LIMIT and
+        take-profits are TAKE_PROFIT_MARKET (taker).
+        """
         trades = []
         qty = order['qty']
         fill_price = order['price']
+        # Entries are limit orders (maker); closes are market/TP orders (taker)
+        is_entry = not order.get('reduce_only', False)
+        fee_rate = fee_maker if is_entry else fee_taker
         fee = qty * fill_price * fee_rate
 
         if order['direction'] == DIR_LONG:
