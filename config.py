@@ -14,15 +14,15 @@ STRATEGY_PARAMS = {
     'er_trend_threshold': 0.5,      # ER above this = trend regime
 
     # ─── Grid ─────────────────────────────────────────────────
-    'grid_spacing_k': 0.5000844670481057,          # δ = k × ATR
-    'grid_levels': 4,              # Levels per side
+    'grid_spacing_k': 0.3,          # δ = k × ATR
+    'grid_levels': 6,              # Levels per side
     'max_orders': 500,              # Max simultaneous orders
-    'spacing_floor': 0.005,         # Min spacing (0.5% of price)
-    'order_pct': 0.04999719568696284,              # Order size as % of capital
+    'spacing_floor': 0.002,         # Min spacing (0.5% of price)
+    'order_pct': 0.03,              # Order size as % of capital
 
     # ─── Inventory (Avellaneda-Stoikov) ───────────────────────
-    'gamma': 0.8,                   # Risk aversion (0.1-2.0)
-    'kappa': 2.3,            # Fill probability parameter
+    'gamma': 0.5,                   # Risk aversion (0.1-2.0)
+    'kappa': 1.5,            # Fill probability parameter
     'skew_factor': 1.5,             # Legacy skew multiplier
     'max_inventory_per_side': 10,   # Max fills per direction
 
@@ -39,14 +39,14 @@ STRATEGY_PARAMS = {
 
     # ─── Pruning (5-Method Gardener) ──────────────────────────
     'max_position_age_hours': 9,   # Oldest trade pruning (hours)
-    'deviance_sigma': 4.679956065163205,          # Deviance pruning (× ATR from KAMA)
+    'deviance_sigma': 3,          # Deviance pruning (× ATR from KAMA)
     'gap_prune_mult': 3.0,          # Gap pruning (× grid spacing)
     'funding_cost_ratio': 0.5,      # Funding pruning threshold
 
     # ─── Risk Management ──────────────────────────────────────
     'max_drawdown_pct': 0.15,       # VaR hard cap (15% of equity)
     'var_confidence': 0.95,         # VaR confidence level
-    'atr_sl_mult': 3.3285830660169395,             # Stop loss = entry ± mult × ATR
+    'atr_sl_mult': 4,             # Stop loss = entry ± mult × ATR
     'max_position_pct': 0.7,        # Max notional per side vs equity
 
     # ─── Funding Rate ─────────────────────────────────────────
