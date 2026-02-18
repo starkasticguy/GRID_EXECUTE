@@ -14,17 +14,17 @@ STRATEGY_PARAMS = {
     'er_trend_threshold': 0.5,      # ER above this = trend regime
 
     # ─── Grid ─────────────────────────────────────────────────
-    'grid_spacing_k': 0.3,          # δ = k × ATR
-    'grid_levels': 6,              # Levels per side
+    'grid_spacing_k': 0.8,          # δ = k × ATR (wider = more profit per fill)
+    'grid_levels': 4,               # Levels per side (less exposure per cycle)
     'max_orders': 500,              # Max simultaneous orders
-    'spacing_floor': 0.002,         # Min spacing (0.5% of price)
-    'order_pct': 0.03,              # Order size as % of capital
+    'spacing_floor': 0.004,         # Min spacing (0.4% of price)
+    'order_pct': 0.04,              # Order size as % of capital
 
     # ─── Inventory (Avellaneda-Stoikov) ───────────────────────
-    'gamma': 0.5,                   # Risk aversion (0.1-2.0)
-    'kappa': 1.5,            # Fill probability parameter
+    'gamma': 0.8,                   # Risk aversion (0.1-2.0) — stronger inventory rejection
+    'kappa': 1.5,                   # Fill probability parameter
     'skew_factor': 1.5,             # Legacy skew multiplier
-    'max_inventory_per_side': 10,   # Max fills per direction
+    'max_inventory_per_side': 6,    # Max fills per direction (strict cap)
 
     # ─── Trailing Up ──────────────────────────────────────────
     'trailing_enabled': True,
@@ -38,16 +38,16 @@ STRATEGY_PARAMS = {
     'resume_z_threshold': -1.0,     # Z-score to resume trading
 
     # ─── Pruning (5-Method Gardener) ──────────────────────────
-    'max_position_age_hours': 9,   # Oldest trade pruning (hours)
-    'deviance_sigma': 3,          # Deviance pruning (× ATR from KAMA)
+    'max_position_age_hours': 18,   # Oldest trade pruning (hours) — give fills time to work
+    'deviance_sigma': 3.5,          # Deviance pruning (× ATR from KAMA)
     'gap_prune_mult': 3.0,          # Gap pruning (× grid spacing)
     'funding_cost_ratio': 0.5,      # Funding pruning threshold
 
     # ─── Risk Management ──────────────────────────────────────
-    'max_drawdown_pct': 0.15,       # VaR hard cap (15% of equity)
+    'max_drawdown_pct': 0.12,       # VaR hard cap (12% of equity)
     'var_confidence': 0.95,         # VaR confidence level
-    'atr_sl_mult': 4,             # Stop loss = entry ± mult × ATR
-    'max_position_pct': 0.7,        # Max notional per side vs equity
+    'atr_sl_mult': 3.0,            # Stop loss = entry ± mult × ATR (tighter = smaller losses)
+    'max_position_pct': 0.5,        # Max notional per side vs equity
 
     # ─── Funding Rate ─────────────────────────────────────────
     'funding_threshold': 0.0003,    # 0.03% adverse funding trigger
@@ -57,7 +57,7 @@ STRATEGY_PARAMS = {
     'fee_maker': -0.00005,          # -0.005% maker rebate
     'fee_taker': 0.0002,            # 0.02% taker fee
     'slippage': 0.0005,             # 0.05% per side
-    'leverage': 5.0,                # 1x default (spot-equivalent)
+    'leverage': 3.0,                # 3x leverage (more margin safety)
     'allow_short': True,            # Enable short grid
 }
 

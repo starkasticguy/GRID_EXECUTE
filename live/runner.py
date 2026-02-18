@@ -973,7 +973,7 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp, sell_sp, anchor_long = get_skewed_grid_params(
             price, inv_q_long, gamma, vol, kappa,
-            base_spacing * spacing_floor, base_spacing)
+            base_spacing, base_spacing)
 
         self.grid_anchor_long = anchor_long
         buy_levels, sell_levels = generate_grid_levels(
@@ -1064,7 +1064,7 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp_s, sell_sp_s, anchor_short = get_skewed_grid_params(
             price, inv_q_short, gamma, vol, kappa,
-            base_spacing * spacing_floor, base_spacing)
+            base_spacing, base_spacing)
 
         self.grid_anchor_short = anchor_short
         buy_levels_s, sell_levels_s = generate_grid_levels(

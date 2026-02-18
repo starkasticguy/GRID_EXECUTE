@@ -336,12 +336,12 @@ class GridStrategyV4:
         final_time = data['timestamp'][-1]
         if self.pos_long.is_open:
             fee = self.pos_long.size * final_price * fee_rate
-            self.pos_long.close_all(final_price, fee)
-            self.wallet_balance += self.pos_long.realized_pnl
+            pnl = self.pos_long.close_all(final_price, fee)
+            self.wallet_balance += pnl
         if self.pos_short.is_open:
             fee = self.pos_short.size * final_price * fee_rate
-            self.pos_short.close_all(final_price, fee)
-            self.wallet_balance += self.pos_short.realized_pnl
+            pnl = self.pos_short.close_all(final_price, fee)
+            self.wallet_balance += pnl
 
         equity_curve[-1] = self.wallet_balance
 
@@ -374,7 +374,7 @@ class GridStrategyV4:
         inv_q_long = normalize_inventory(self.pos_long.size,
                                           max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp, sell_sp, anchor_long = get_skewed_grid_params(
-            price, inv_q_long, gamma, vol, kappa, base_spacing * spacing_floor, base_spacing)
+            price, inv_q_long, gamma, vol, kappa, base_spacing, base_spacing)
 
         self.grid_anchor_long = anchor_long
         buy_levels, sell_levels = generate_grid_levels(
@@ -412,7 +412,7 @@ class GridStrategyV4:
                 -self.pos_short.size,
                 max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
             buy_sp_s, sell_sp_s, anchor_short = get_skewed_grid_params(
-                price, inv_q_short, gamma, vol, kappa, base_spacing * spacing_floor, base_spacing)
+                price, inv_q_short, gamma, vol, kappa, base_spacing, base_spacing)
 
             self.grid_anchor_short = anchor_short
             buy_levels_s, sell_levels_s = generate_grid_levels(
