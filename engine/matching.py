@@ -7,8 +7,8 @@ Conservative fill model:
 
 No partial fills, no slippage model in matching (slippage applied at execution).
 """
+import numpy as np
 from engine.types import STATUS_OPEN, STATUS_FILLED, STATUS_CANCELLED
-import random
 
 
 class OrderBook:
@@ -80,11 +80,11 @@ class OrderBook:
             is_fill = False
             if order['side'] == 1:  # Buy
                 if low <= order['price']:
-                    if random.random() < fill_prob:
+                    if np.random.random() < fill_prob:
                         is_fill = True
             elif order['side'] == -1:  # Sell
                 if high >= order['price']:
-                    if random.random() < fill_prob:
+                    if np.random.random() < fill_prob:
                         is_fill = True
 
             if is_fill:

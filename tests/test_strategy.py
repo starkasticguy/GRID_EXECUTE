@@ -176,13 +176,25 @@ class TestLookaheadFree:
         We construct two DataFrames that share the first 200 bars identically
         (including OHLC), then differ afterward. If there's no lookahead,
         the equity curves for the first 200 bars must match exactly.
+
+        Notes:
+        - fill_probability is set to 1.0 (deterministic fills) so the two runs
+          are not affected by stochastic fill sampling. The 90% fill probability
+          used in normal backtests samples np.random per order; if the two runs
+          start with different RNG states the results differ even with identical
+          data — that is NOT a lookahead bug.
+        - We compare bars 0..198 only. Bar 199 is the last bar of df_short so
+          run() forces equity_curve[-1] = wallet_balance after closing all open
+          positions. For df_long bar 199 is mid-run with no force-close; this
+          end-of-run artifact is expected and not a lookahead issue.
         """
-        # Generate 300 bars of deterministic data
+        import config as cfg_module
+
+        # Generate 300 bars of fully deterministic data (no random OHLC)
         np.random.seed(999)
         all_close = 100.0 + np.cumsum(np.random.normal(0, 0.3, 300))
         all_close = np.maximum(all_close, 10.0)
 
-        # Deterministic OHLC (no random after close generation)
         base_ts = int(pd.Timestamp('2024-01-01').timestamp() * 1000)
 
         def make_df_from_close(close_arr):
@@ -200,18 +212,29 @@ class TestLookaheadFree:
         df_short = make_df_from_close(all_close[:200])
         df_long = make_df_from_close(all_close[:300])
 
-        config = make_config()
+        # Force deterministic fills — this test is about lookahead, not fill luck
+        orig_fill_prob = cfg_module.BACKTEST_FILL_CONF['fill_probability']
+        cfg_module.BACKTEST_FILL_CONF['fill_probability'] = 1.0
+        try:
+            config = make_config()
 
-        strat1 = GridStrategyV4(config.copy())
-        r1 = strat1.run(df_short)
+            np.random.seed(42)
+            strat1 = GridStrategyV4(config.copy())
+            r1 = strat1.run(df_short)
 
-        strat2 = GridStrategyV4(config.copy())
-        r2 = strat2.run(df_long)
+            np.random.seed(42)
+            strat2 = GridStrategyV4(config.copy())
+            r2 = strat2.run(df_long)
+        finally:
+            cfg_module.BACKTEST_FILL_CONF['fill_probability'] = orig_fill_prob
 
-        # First 200 bars should be identical (no lookahead)
+        # Bars 0..198 must be identical (no lookahead).
+        # Bar 199 is excluded: it is the terminal bar of df_short where run()
+        # force-closes all positions (equity_curve[-1] = wallet_balance), while
+        # for df_long bar 199 is mid-run with positions still open.
         np.testing.assert_array_almost_equal(
-            r1['equity_curve'][:200],
-            r2['equity_curve'][:200],
+            r1['equity_curve'][:199],
+            r2['equity_curve'][:199],
             decimal=2,
             err_msg="Equity curves differ — possible lookahead bias!"
         )
