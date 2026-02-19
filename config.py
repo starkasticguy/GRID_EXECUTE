@@ -15,16 +15,16 @@ STRATEGY_PARAMS = {
 
     # ─── Grid ─────────────────────────────────────────────────
     'grid_spacing_k': 0.4,          # δ = k × ATR (wider = more profit per fill)
-    'grid_levels': 4,               # Levels per side (less exposure per cycle)
+    'grid_levels': 3,               # Levels per side (less exposure per cycle)
     'max_orders': 500,              # Max simultaneous orders
-    'spacing_floor': 0.003,         # Min spacing (0.3% of price)
+    'spacing_floor': 0.005,         # Min spacing (0.3% of price)
     'order_pct': 0.04,              # Order size as % of capital
 
     # ─── Inventory (Avellaneda-Stoikov) ───────────────────────
-    'gamma': 0.8,                   # Risk aversion (0.1-2.0) — stronger inventory rejection
+    'gamma': 1.2,                   # Risk aversion (0.1-2.0) — stronger inventory rejection
     'kappa': 1.5,                   # Fill probability parameter
     'skew_factor': 1.5,             # Legacy skew multiplier
-    'max_inventory_per_side': 6,    # Max fills per direction (strict cap)
+    'max_inventory_per_side': 3,    # Max fills per direction (strict cap)
 
     # ─── Trailing Up ──────────────────────────────────────────
     'trailing_enabled': True,
@@ -109,18 +109,35 @@ BACKTEST_FILL_CONF = {
 
 # ─── Optimizer Parameter Space ────────────────────────────────
 # Used by optimizer.py for Bayesian/GA search
+# Organized by category. Ranges are constrained to prevent degenerate configs.
 OPTIMIZER_SPACE = {
-    'grid_spacing_k':   {'type': 'float', 'low': 0.5,  'high': 3.0},
-    'spacing_floor':    {'type': 'float', 'low': 0.002, 'high': 0.008},
-    'grid_levels':      {'type': 'int',   'low': 3,    'high': 20},
-    'gamma':            {'type': 'float', 'low': 0.1,  'high': 2.0},
-    'kappa':            {'type': 'float', 'low': 0.5,  'high': 3.0},
-    'order_pct':        {'type': 'float', 'low': 0.005,'high': 0.05},
-    'atr_sl_mult':      {'type': 'float', 'low': 2.0,  'high': 5.0},
-    'regime_threshold': {'type': 'float', 'low': 0.05, 'high': 0.3},
-    'er_trend_threshold':{'type': 'float', 'low': 0.3,  'high': 0.7},
+    # ─── Grid Structure (core profitability) ──────────────────
+    'grid_spacing_k':   {'type': 'float', 'low': 0.3,  'high': 2.0},   # ATR multiplier for spacing
+    'spacing_floor':    {'type': 'float', 'low': 0.003, 'high': 0.008}, # Min spacing (% of price)
+    'grid_levels':      {'type': 'int',   'low': 2,    'high': 8},      # Levels per side (was 3-20, too wide)
+    'order_pct':        {'type': 'float', 'low': 0.01, 'high': 0.06},   # Order size as % of capital
+
+    # ─── Inventory Control (THE key risk param) ───────────────
+    'gamma':            {'type': 'float', 'low': 0.3,  'high': 2.0},    # A-S risk aversion
+    'kappa':            {'type': 'float', 'low': 0.5,  'high': 3.0},    # A-S fill probability
+    'max_inventory_per_side': {'type': 'int', 'low': 2, 'high': 6},     # Max fills per direction (CRITICAL)
+
+    # ─── Regime Detection ─────────────────────────────────────
+    'regime_threshold': {'type': 'float', 'low': 0.05, 'high': 0.3},    # KAMA slope theta
+    'er_trend_threshold':{'type': 'float', 'low': 0.3, 'high': 0.7},    # ER threshold for trend
+
+    # ─── Risk Management ──────────────────────────────────────
+    'atr_sl_mult':      {'type': 'float', 'low': 2.0,  'high': 5.0},    # Stop loss ATR multiplier
+    'max_position_pct': {'type': 'float', 'low': 0.3,  'high': 0.7},    # Max notional per side vs equity
+    'max_drawdown_pct': {'type': 'float', 'low': 0.08, 'high': 0.20},   # VaR hard cap
+
+    # ─── Pruning ──────────────────────────────────────────────
+    'max_position_age_hours': {'type': 'int', 'low': 6, 'high': 48},    # Max fill age (was 6-72, too wide)
+    'deviance_sigma':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Deviance pruning threshold
+    'gap_prune_mult':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Gap pruning threshold
+    'funding_cost_ratio':{'type': 'float', 'low': 0.3,  'high': 0.8},   # Funding pruning threshold
+
+    # ─── Mode Switches ────────────────────────────────────────
     'trailing_enabled': {'type': 'cat',   'choices': [True, False]},
     'allow_short':      {'type': 'cat',   'choices': [True, False]},
-    'max_position_age_hours': {'type': 'int', 'low': 6, 'high': 72},
-    'deviance_sigma':   {'type': 'float', 'low': 2.0,  'high': 5.0},
 }
