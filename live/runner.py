@@ -1350,6 +1350,18 @@ class LiveRunner:
                 'LONG', long_orders,
                 (float(buy_levels[-1]) if len(buy_levels) > 0 else price,
                  float(sell_levels[-1]) if len(sell_levels) > 0 else price))
+            if self.tg:
+                buy_range = (f"${float(buy_levels[-1]):,.2f} – ${float(buy_levels[0]):,.2f}"
+                             if len(buy_levels) > 0 else 'none')
+                sell_range = (f"${float(sell_levels[0]):,.2f} – ${float(sell_levels[-1]):,.2f}"
+                              if len(sell_levels) > 0 else 'none')
+                self.tg.send(
+                    f'📋 <b>LONG GRID PLACED</b> — <code>{self.symbol}</code>\n'
+                    f'Price:    <code>${price:,.2f}</code>  ATR=<code>{atr:.2f}</code>\n'
+                    f'Buys:     <code>{buy_range}</code>\n'
+                    f'TPs:      <code>{sell_range}</code>\n'
+                    f'Orders:   <code>{long_orders}</code>  spacing=<code>{base_spacing:.2f}</code>',
+                    silent=True)
 
         # ─── SHORT GRID ─────────────────────────────────────
         if not allow_short:
@@ -1442,6 +1454,18 @@ class LiveRunner:
                 'SHORT', short_orders,
                 (float(buy_levels_s[-1]) if len(buy_levels_s) > 0 else price,
                  float(sell_levels_s[-1]) if len(sell_levels_s) > 0 else price))
+            if self.tg:
+                sell_range = (f"${float(sell_levels_s[0]):,.2f} – ${float(sell_levels_s[-1]):,.2f}"
+                              if len(sell_levels_s) > 0 else 'none')
+                buy_range = (f"${float(buy_levels_s[-1]):,.2f} – ${float(buy_levels_s[0]):,.2f}"
+                             if len(buy_levels_s) > 0 else 'none')
+                self.tg.send(
+                    f'📋 <b>SHORT GRID PLACED</b> — <code>{self.symbol}</code>\n'
+                    f'Price:    <code>${price:,.2f}</code>  ATR=<code>{atr:.2f}</code>\n'
+                    f'Sells:    <code>{sell_range}</code>\n'
+                    f'TPs:      <code>{buy_range}</code>\n'
+                    f'Orders:   <code>{short_orders}</code>  spacing=<code>{base_spacing:.2f}</code>',
+                    silent=True)
 
     # ─── Equity Helpers ──────────────────────────────────────────
 
@@ -1478,6 +1502,18 @@ class LiveRunner:
         }
         self.trade_logger.log_trade(trade)
         self.state.save_trade(trade)
+
+        # Telegram: notify on every trade event
+        if self.tg:
+            regime_names = {0: 'NOISE', 1: 'UPTREND', -1: 'DOWNTREND',
+                            2: 'BREAKOUT_UP', -2: 'BREAKOUT_DOWN'}
+            regime_str = regime_names.get(regime, str(regime))
+            equity = trade['equity_after']
+            # Stops/CB/liquidations are loud (sound on); fills are silent
+            is_loud = any(k in label for k in ('STOP', 'CIRCUIT', 'LIQUIDATION'))
+            self.tg.send(
+                fmt_trade(label, self.symbol, price, qty, pnl, regime_str, equity),
+                silent=not is_loud)
 
     def _log_equity_bar(self, timestamp, price, regime):
         """Log equity snapshot for this bar."""
