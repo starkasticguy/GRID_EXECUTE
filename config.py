@@ -38,9 +38,9 @@ STRATEGY_PARAMS = {
     'resume_z_threshold': -1.0,     # Z-score to resume trading
 
     # ─── Pruning (5-Method Gardener) ──────────────────────────
-    'max_position_age_hours': 18,   # Oldest trade pruning (hours) — give fills time to work
-    'deviance_sigma': 3.5,          # Deviance pruning (× ATR from KAMA)
-    'gap_prune_mult': 3.0,          # Gap pruning (× grid spacing)
+    'max_position_age_hours': 12,   # Oldest trade pruning (hours) — give fills time to work
+    'deviance_sigma': 2.5,          # Deviance pruning (× ATR from KAMA)
+    'gap_prune_mult': 2.5,          # Gap pruning (× grid spacing)
     'funding_cost_ratio': 0.5,      # Funding pruning threshold
 
     # ─── Risk Management ──────────────────────────────────────
@@ -113,9 +113,9 @@ BACKTEST_FILL_CONF = {
 OPTIMIZER_SPACE = {
     # ─── Grid Structure (core profitability) ──────────────────
     'grid_spacing_k':   {'type': 'float', 'low': 0.3,  'high': 2.0},   # ATR multiplier for spacing
-    'spacing_floor':    {'type': 'float', 'low': 0.003, 'high': 0.008}, # Min spacing (% of price)
+ #   'spacing_floor':    {'type': 'float', 'low': 0.003, 'high': 0.009}, # Min spacing (% of price)
     'grid_levels':      {'type': 'int',   'low': 2,    'high': 8},      # Levels per side (was 3-20, too wide)
-    'order_pct':        {'type': 'float', 'low': 0.01, 'high': 0.06},   # Order size as % of capital
+ #   'order_pct':        {'type': 'float', 'low': 0.01, 'high': 0.06},   # Order size as % of capital
 
     # ─── Inventory Control (THE key risk param) ───────────────
     'gamma':            {'type': 'float', 'low': 0.3,  'high': 2.0},    # A-S risk aversion
@@ -123,19 +123,19 @@ OPTIMIZER_SPACE = {
     'max_inventory_per_side': {'type': 'int', 'low': 2, 'high': 6},     # Max fills per direction (CRITICAL)
 
     # ─── Regime Detection ─────────────────────────────────────
-    'regime_threshold': {'type': 'float', 'low': 0.05, 'high': 0.3},    # KAMA slope theta
-    'er_trend_threshold':{'type': 'float', 'low': 0.3, 'high': 0.7},    # ER threshold for trend
+ #   'regime_threshold': {'type': 'float', 'low': 0.05, 'high': 0.3},    # KAMA slope theta
+ #   'er_trend_threshold':{'type': 'float', 'low': 0.3, 'high': 0.7},    # ER threshold for trend
 
     # ─── Risk Management ──────────────────────────────────────
     'atr_sl_mult':      {'type': 'float', 'low': 2.0,  'high': 5.0},    # Stop loss ATR multiplier
     'max_position_pct': {'type': 'float', 'low': 0.3,  'high': 0.7},    # Max notional per side vs equity
-    'max_drawdown_pct': {'type': 'float', 'low': 0.08, 'high': 0.20},   # VaR hard cap
+#   'max_drawdown_pct': {'type': 'float', 'low': 0.08, 'high': 0.20},   # VaR hard cap
 
     # ─── Pruning ──────────────────────────────────────────────
-    'max_position_age_hours': {'type': 'int', 'low': 6, 'high': 48},    # Max fill age (was 6-72, too wide)
-    'deviance_sigma':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Deviance pruning threshold
-    'gap_prune_mult':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Gap pruning threshold
-    'funding_cost_ratio':{'type': 'float', 'low': 0.3,  'high': 0.8},   # Funding pruning threshold
+ #   'max_position_age_hours': {'type': 'int', 'low': 6, 'high': 48},    # Max fill age (was 6-72, too wide)
+ #   'deviance_sigma':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Deviance pruning threshold
+#    'gap_prune_mult':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Gap pruning threshold
+ #   'funding_cost_ratio':{'type': 'float', 'low': 0.3,  'high': 0.8},   # Funding pruning threshold
 
     # ─── Mode Switches ────────────────────────────────────────
     'trailing_enabled': {'type': 'cat',   'choices': [True, False]},

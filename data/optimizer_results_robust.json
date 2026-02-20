@@ -1,0 +1,37 @@
+{
+    "robust_params": {
+        "grid_spacing_k": 1.8624177736738288,
+        "grid_levels": 2,
+        "gamma": 0.829811748743019,
+        "kappa": 1.4179145156475932,
+        "max_inventory_per_side": 6,
+        "atr_sl_mult": 2.0662213205394186,
+        "max_position_pct": 0.37659545305658615,
+        "trailing_enabled": false,
+        "allow_short": false
+    },
+    "param_stability": {
+        "grid_spacing_k": 0.0165,
+        "grid_levels": 0.1742,
+        "gamma": 0.1359,
+        "kappa": 0.2226,
+        "max_inventory_per_side": 0.0943,
+        "atr_sl_mult": 0.0729,
+        "max_position_pct": 0.1668,
+        "trailing_enabled": 0.0,
+        "allow_short": 0.0
+    },
+    "robustness_score": 0.098133,
+    "num_trials": 2400,
+    "top_trials_used": 240,
+    "best_single_trial_score": -0.43809219046559,
+    "n_windows": 3,
+    "coins": [
+        "BTC/USDT",
+        "ETH/USDT",
+        "SOL/USDT"
+    ],
+    "mc_significant": false,
+    "mc_p_value": 0.66,
+    "oos_pass": "False"
+}

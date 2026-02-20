@@ -22,7 +22,7 @@ import math
 
 def calculate_reservation_price(mid_price: float, inventory_q: float,
                                 gamma: float, volatility: float,
-                                time_horizon: float = 1.0) -> float:
+                                time_horizon: float = 96.0) -> float:
     """
     Avellaneda-Stoikov reservation price (price-scaled).
 
@@ -35,7 +35,11 @@ def calculate_reservation_price(mid_price: float, inventory_q: float,
         inventory_q: Normalized inventory [-1, 1] where positive = long bias
         gamma: Risk aversion parameter (0.1 – 2.0)
         volatility: σ (raw 15m standard deviation of log returns)
-        time_horizon: Rolling horizon T (1.0 for perpetuals)
+        time_horizon: Rolling horizon T in 15m bars (96 = 1 day).
+                      For perpetuals, this represents how long you're willing
+                      to hold inventory before risk becomes unacceptable.
+                      T=1.0 produces negligible skew; T=96 gives ~0.1% skew
+                      at full inventory with typical crypto volatility.
     """
     skew_frac = inventory_q * gamma * (volatility ** 2) * time_horizon
     return mid_price * (1.0 - skew_frac)
@@ -43,7 +47,7 @@ def calculate_reservation_price(mid_price: float, inventory_q: float,
 
 def calculate_optimal_spread(volatility: float, gamma: float,
                              kappa: float = 1.5,
-                             time_horizon: float = 1.0,
+                             time_horizon: float = 96.0,
                              ref_price: float = 1.0) -> float:
     """
     Volatility-based spread component from A-S model (price-scaled).
@@ -67,7 +71,8 @@ def get_skewed_grid_params(mid_price: float, inventory_q: float,
                            gamma: float, volatility: float,
                            kappa: float = 1.5,
                            min_spacing: float = 0.0,
-                           atr_spacing: float = 0.0) -> tuple:
+                           atr_spacing: float = 0.0,
+                           time_horizon: float = 96.0) -> tuple:
     """
     Full Avellaneda-Stoikov grid parameter computation.
 
@@ -81,11 +86,17 @@ def get_skewed_grid_params(mid_price: float, inventory_q: float,
     - Inventory skew via the reservation price shift
     - Volatility widening when σ spikes
 
+    Args:
+        time_horizon: A-S rolling horizon T in 15m bars (default 96 = 1 day).
+
     Returns:
         (buy_spacing, sell_spacing, anchor_price_r)
     """
-    r = calculate_reservation_price(mid_price, inventory_q, gamma, volatility)
-    delta = calculate_optimal_spread(volatility, gamma, kappa, ref_price=mid_price)
+    r = calculate_reservation_price(mid_price, inventory_q, gamma, volatility,
+                                    time_horizon=time_horizon)
+    delta = calculate_optimal_spread(volatility, gamma, kappa,
+                                     time_horizon=time_horizon,
+                                     ref_price=mid_price)
 
     # Enforce minimum spacing (from ATR-based or absolute floor)
     final_spacing = max(delta, min_spacing, atr_spacing)

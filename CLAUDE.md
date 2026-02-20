@@ -26,7 +26,7 @@ A hedge-mode grid trading system on 15-minute candles that dynamically adapts to
 
 **Version**: V4.0
 **Status**: Complete (Backtest + Live Execution)
-**Tests**: 88/88 passing (57 backtest + 31 live)
+**Tests**: 121/121 passing (57 backtest + 64 live)
 **Architecture**: Pure Python/NumPy (Numba-ready structure for future acceleration)
 
 ---
@@ -101,7 +101,7 @@ GRID_Trade/
 │   ├── simulator.py             # BacktestSimulator wrapper (single/multi-coin)
 │   └── data_fetcher.py          # Binance OHLCV via ccxt + parquet caching
 │
-├── tests/                       # Test suite (88 tests)
+├── tests/                       # Test suite (121 tests)
 │   ├── __init__.py
 │   ├── test_indicators.py       # KAMA, ER, ATR, Z-Score, regime, volatility (15 tests)
 │   ├── test_strategy.py         # Full backtest, hedge mode, CB, lookahead-free (12 tests)
@@ -164,6 +164,7 @@ Optimal Spread:     delta = gamma * sigma^2 * T + (2/gamma) * ln(1 + gamma/kappa
 - Long inventory (q > 0) shifts `r` below `s` = sells closer, buys further
 - Short inventory (q < 0) shifts `r` above `s` = buys closer, sells further
 - `gamma` = risk aversion (0.1-2.0), `kappa` = fill probability, `sigma` = rolling volatility
+- `T` = time horizon in 15m bars (default **96** = 1 day). T=1.0 produces ~$0.01 skew on ETH; T=96 produces ~$2 — the model is now meaningfully active.
 
 ### 4. Circuit Breaker
 
@@ -216,7 +217,7 @@ Two independent position trackers:
 - **Tiered Margin**: 7-tier Binance USDM specification (0.4% to 12.5% MMR)
 - **Iterative Liquidation**: Converges in ~3-5 iterations (MMR depends on P_liq)
 - **VaR Constraint**: `VaR_95 = Portfolio * 1.65 * sigma_15m` blocks new orders if > max_drawdown * equity
-- **ATR Stop Loss**: Entry +/- atr_sl_mult * ATR per side
+- **ATR Stop Loss (2-stage)**: Stage 1 closes 50% at `entry ± sl_mult × ATR` (multi-fill); Stage 2 closes remainder at `1.5×` multiplier. Single-fill positions close 100% immediately.
 
 ---
 
@@ -226,12 +227,13 @@ Two independent position trackers:
 for each bar i (starting from 1):
     1. REGIME        - Read from pre-computed indicators[i-1] (no lookahead)
     2. CIRCUIT BREAK  - Halt if Z < -3, resume if Z > -1
-    3. STOP LOSS      - ATR-based stops for both long and short
+    3. STOP LOSS      - 2-stage ATR stops: 50% close at 1× mult, remainder at 1.5× (multi-fill)
     4. LIQUIDATION     - Check if leveraged positions hit liquidation price
     5. PRUNING         - Run 5-method cycle on both sides
     6. TRAILING UP     - Shift grid anchor upward in uptrends
     7. VaR CHECK       - Block new orders if VaR exceeds limit
-    8. GRID GENERATE   - A-S skewed grid with regime-aware filtering
+    8. GRID GENERATE   - A-S skewed grid (T=96, meaningful ~$2 skew on ETH); regen only on
+                          price drift >1 spacing or regime change (not every fill)
     9. FILL MATCHING   - Conservative: Buy if Low <= Price, Sell if High >= Price
    10. FUNDING RATE    - Apply every 32 bars (8h intervals)
    11. LOG EQUITY      - Wallet + unrealized PnL both sides
@@ -256,6 +258,7 @@ for each bar i (starting from 1):
 # Inventory (Avellaneda-Stoikov)
 'gamma': 0.5                 # Risk aversion
 'kappa': 1.5                 # Fill probability
+'as_time_horizon': 96.0      # T in 15m bars (96 = 1 day); controls inventory skew magnitude
 
 # Trailing Up
 'trailing_activation_er': 0.65
@@ -430,6 +433,6 @@ Read from environment variables `BINANCE_API_KEY` and `BINANCE_API_SECRET`.
 
 ---
 
-**Version**: V4.0
-**Date**: 2026-02-15
-**Status**: Complete (Backtest + Live Execution) - 88/88 tests passing
+**Version**: V4.1
+**Date**: 2026-02-20
+**Status**: Complete (Backtest + Live Execution) - 121/121 tests passing

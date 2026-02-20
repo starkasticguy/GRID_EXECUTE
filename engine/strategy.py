@@ -70,6 +70,12 @@ class GridStrategyV4:
         self.grid_anchor_long = 0.0
         self.grid_anchor_short = 0.0
         self.grid_needs_regen = True
+        self._last_grid_spacing = 0.0
+        self._prev_regime = 0
+
+        # Partial stop loss state: tracks if first-stage stop already fired
+        self._partial_stop_fired_long = False
+        self._partial_stop_fired_short = False
 
         # Trailing state
         self.trailing_anchor = 0.0
@@ -163,6 +169,7 @@ class GridStrategyV4:
         max_inv_per_side = self.config.get('max_inventory_per_side', 10)
         atr_sl_mult = self.config.get('atr_sl_mult', 3.5)
         max_position_pct = self.config.get('max_position_pct', 0.7)
+        as_time_horizon = self.config.get('as_time_horizon', 96.0)
 
         trailing_enabled = self.config.get('trailing_enabled', True)
         trailing_er = self.config.get('trailing_activation_er', 0.65)
@@ -292,8 +299,9 @@ class GridStrategyV4:
                     cur_close, prev_atr, prev_vol, prev_regime, prev_funding,
                     cur_time, grid_levels, spacing_k, spacing_floor,
                     gamma, kappa, order_pct, leverage, max_inv_per_side,
-                    max_position_pct, allow_short)
+                    max_position_pct, allow_short, as_time_horizon)
                 self.grid_needs_regen = False
+                self._prev_regime = prev_regime
 
             # ─── 9. CHECK FILLS ───────────────────────────────
             filled_orders = self.order_book.check_fills(cur_high, cur_low, fill_prob)
@@ -310,9 +318,17 @@ class GridStrategyV4:
                         else:
                             accumulated_profit_short += t['pnl']
 
-            # After fills, mark grid for regen on next bar
+            # Smart grid regen: only regenerate when price moves >1 spacing
+            # from anchor or regime changed. Avoids cancel-and-replace churn
+            # that loses queue position on every fill.
             if filled_orders:
-                self.grid_needs_regen = True
+                regen_spacing = self._last_grid_spacing if self._last_grid_spacing > 0 else grid_spacing
+                anchor_drift_long = abs(cur_close - self.grid_anchor_long)
+                anchor_drift_short = abs(cur_close - self.grid_anchor_short)
+                regime_changed = (prev_regime != self._prev_regime)
+                if anchor_drift_long > regen_spacing or anchor_drift_short > regen_spacing or regime_changed:
+                    self.grid_needs_regen = True
+                self._prev_regime = prev_regime
 
             # ─── 10. FUNDING RATE ─────────────────────────────
             if is_funding_interval(i):
@@ -359,7 +375,8 @@ class GridStrategyV4:
     def _generate_and_place_grid(self, price, atr, vol, regime, funding_rate,
                                  timestamp, grid_levels, spacing_k, spacing_floor,
                                  gamma, kappa, order_pct, leverage,
-                                 max_inv_per_side, max_position_pct, allow_short):
+                                 max_inv_per_side, max_position_pct, allow_short,
+                                 as_time_horizon=96.0):
         """Generate and place grid orders based on regime and inventory."""
 
         base_spacing = calculate_dynamic_spacing(atr, spacing_k, spacing_floor, price)
@@ -376,7 +393,9 @@ class GridStrategyV4:
         inv_q_long = normalize_inventory(self.pos_long.size,
                                           max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp, sell_sp, anchor_long = get_skewed_grid_params(
-            price, inv_q_long, gamma, vol, kappa, base_spacing, base_spacing)
+            price, inv_q_long, gamma, vol, kappa, base_spacing, base_spacing,
+            time_horizon=as_time_horizon)
+        self._last_grid_spacing = base_spacing
 
         self.grid_anchor_long = anchor_long
         buy_levels, sell_levels = generate_grid_levels(
@@ -414,7 +433,8 @@ class GridStrategyV4:
                 -self.pos_short.size,
                 max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
             buy_sp_s, sell_sp_s, anchor_short = get_skewed_grid_params(
-                price, inv_q_short, gamma, vol, kappa, base_spacing, base_spacing)
+                price, inv_q_short, gamma, vol, kappa, base_spacing, base_spacing,
+                time_horizon=as_time_horizon)
 
             self.grid_anchor_short = anchor_short
             buy_levels_s, sell_levels_s = generate_grid_levels(
@@ -504,36 +524,82 @@ class GridStrategyV4:
 
     def _check_stop_loss(self, price, low, high, timestamp, bar_idx,
                          kama, atr, sl_mult, fee_rate, regime, slippage=0.0) -> list:
-        """ATR-based stop loss for both sides."""
+        """ATR-based stop loss for both sides.
+
+        Partial stop: if position has >1 fill, first trigger closes 50%
+        and sets a wider stop (1.5× mult) for the remainder. Single-fill
+        positions close 100% immediately.
+        """
         trades = []
 
-        # Long stop: if low drops below entry - sl_mult * ATR
+        # Long stop
         if self.pos_long.is_open:
-            stop_price = self.pos_long.avg_entry - sl_mult * atr
+            # Use wider multiplier if first stage already fired
+            effective_mult = sl_mult * 1.5 if self._partial_stop_fired_long else sl_mult
+            stop_price = self.pos_long.avg_entry - effective_mult * atr
             if low <= stop_price:
-                exit_price = stop_price * (1 - slippage)  # Apply slippage
-                fee = self.pos_long.size * exit_price * fee_rate
-                pnl = self.pos_long.close_all(exit_price, fee)
-                self.wallet_balance += pnl
-                self.metrics['stops_long'] += 1
-                trades.append(self._trade_record(
-                    bar_idx, timestamp, exit_price, 0,
-                    LABEL_STOP_LONG, regime, pnl=pnl))
+                exit_price = stop_price * (1 - slippage)
+
+                if self.pos_long.num_fills > 1 and not self._partial_stop_fired_long:
+                    # Stage 1: close 50% of position
+                    close_qty = self.pos_long.size * 0.5
+                    fee = close_qty * exit_price * fee_rate
+                    pnl = self.pos_long.close_fill(exit_price, close_qty, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_long'] += 1
+                    self._partial_stop_fired_long = True
+                    trades.append(self._trade_record(
+                        bar_idx, timestamp, exit_price, close_qty,
+                        LABEL_STOP_LONG, regime, pnl=pnl))
+                else:
+                    # Stage 2 (or single fill): close everything
+                    fee = self.pos_long.size * exit_price * fee_rate
+                    pnl = self.pos_long.close_all(exit_price, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_long'] += 1
+                    self._partial_stop_fired_long = False
+                    trades.append(self._trade_record(
+                        bar_idx, timestamp, exit_price, 0,
+                        LABEL_STOP_LONG, regime, pnl=pnl))
                 self.grid_needs_regen = True
 
-        # Short stop: if high rises above entry + sl_mult * ATR
+        # Reset partial stop state if position closed elsewhere
+        if not self.pos_long.is_open:
+            self._partial_stop_fired_long = False
+
+        # Short stop
         if self.pos_short.is_open:
-            stop_price = self.pos_short.avg_entry + sl_mult * atr
+            effective_mult = sl_mult * 1.5 if self._partial_stop_fired_short else sl_mult
+            stop_price = self.pos_short.avg_entry + effective_mult * atr
             if high >= stop_price:
-                exit_price = stop_price * (1 + slippage)  # Apply slippage
-                fee = self.pos_short.size * exit_price * fee_rate
-                pnl = self.pos_short.close_all(exit_price, fee)
-                self.wallet_balance += pnl
-                self.metrics['stops_short'] += 1
-                trades.append(self._trade_record(
-                    bar_idx, timestamp, exit_price, 0,
-                    LABEL_STOP_SHORT, regime, pnl=pnl))
+                exit_price = stop_price * (1 + slippage)
+
+                if self.pos_short.num_fills > 1 and not self._partial_stop_fired_short:
+                    # Stage 1: close 50% of position
+                    close_qty = self.pos_short.size * 0.5
+                    fee = close_qty * exit_price * fee_rate
+                    pnl = self.pos_short.close_fill(exit_price, close_qty, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_short'] += 1
+                    self._partial_stop_fired_short = True
+                    trades.append(self._trade_record(
+                        bar_idx, timestamp, exit_price, close_qty,
+                        LABEL_STOP_SHORT, regime, pnl=pnl))
+                else:
+                    # Stage 2 (or single fill): close everything
+                    fee = self.pos_short.size * exit_price * fee_rate
+                    pnl = self.pos_short.close_all(exit_price, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_short'] += 1
+                    self._partial_stop_fired_short = False
+                    trades.append(self._trade_record(
+                        bar_idx, timestamp, exit_price, 0,
+                        LABEL_STOP_SHORT, regime, pnl=pnl))
                 self.grid_needs_regen = True
+
+        # Reset partial stop state if position closed elsewhere
+        if not self.pos_short.is_open:
+            self._partial_stop_fired_short = False
 
         return trades
 

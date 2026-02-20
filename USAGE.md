@@ -274,7 +274,7 @@ Fetching BTC/USDT...
 
 ## Running the Optimizer (optimizer.py)
 
-Finds optimal parameters using walk-forward validation with Optuna.
+Finds optimal parameters using anchored walk-forward validation with Optuna, then selects a **robust parameter cluster** (top-10-percentile median) instead of the single best trial to reduce overfitting.
 
 ### Basic Usage
 
@@ -286,18 +286,20 @@ python3 optimizer.py --coins BTC SOL --trials 200
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--coins` | list | `BTC/USDT SOL/USDT` | Coins to optimize across |
+| `--coins` | list | `BTC/USDT ETH/USDT SOL/USDT` | Coins to optimize across |
 | `--trials` | int | `100` | Number of Optuna trials |
 | `--start` | string | `2024-01-01` | Data start date |
 | `--end` | string | Current date | Data end date |
-| `--windows` | int | `3` | Walk-forward validation windows |
-| `--study-name` | string | `grid_v4_study` | Optuna study name (for resume) |
+| `--windows` | int | `4` | Walk-forward windows |
+| `--study-name` | string | `grid_v4_wfo` | Optuna study name (for resume) |
+| `--mc-perms` | int | `50` | Monte Carlo permutations |
+| `--skip-mc` | flag | off | Skip Monte Carlo validation |
 
 ### Examples
 
 ```bash
-# Quick optimization (50 trials)
-python3 optimizer.py --coins BTC --trials 50
+# Quick optimization (50 trials, skip MC for speed)
+python3 optimizer.py --coins BTC --trials 50 --skip-mc
 
 # Full optimization across 3 coins
 python3 optimizer.py --coins BTC ETH SOL --trials 500 --windows 4
@@ -315,48 +317,77 @@ python3 optimizer.py --coins BTC SOL --trials 100 --study-name my_study  # adds 
 1. Loads OHLCV data for all specified coins
 2. For each Optuna trial:
    - Samples parameters from `OPTIMIZER_SPACE` in `config.py`
-   - Splits data into walk-forward windows (70% train / 30% test)
-   - Runs strategy on train data (sanity check)
-   - Evaluates on test data only (prevents overfitting)
-   - Scores using Calmar Ratio + complexity penalty
-3. Averages score across all coins and windows
-4. Applies stability penalty for high variance across windows
-5. After all trials: prints best parameters
-6. Saves best parameters to `data/best_params_v4.json`
-7. Runs final out-of-sample validation on held-out 30%
+   - Splits data into anchored walk-forward windows (70% train / 30% test)
+   - Evaluates on **train** data (TPE learns from this)
+   - Stores **test** scores as held-out attributes (no leakage)
+   - Scores using pessimistic (min) Calmar × sqrt(PF) across all windows
+3. After all trials:
+   - **Robust parameter selection**: takes the top-10% of trials, computes the **median** of each parameter across the cluster
+   - Prints a parameter stability report (Coefficient of Variation per param)
+   - Runs OOS validation and Monte Carlo significance test on the **robust params**
+4. Saves results to `data/optimizer_results_robust.json` (primary output)
+5. Also saves single-best trial to `data/best_params_v4.json` (reference only)
+
+### Robust Parameter Report (Sample Output)
+
+```
+===== ROBUST PARAMETER REPORT =====
+(Top 10% of 200 trials = 20 trials used)
+
+Robust Parameters (median of top cluster):
+  grid_spacing_k             0.4200  (default: 0.4)
+  gamma                      0.9800  (default: 1.2)
+  ...
+
+Parameter Stability (CV — lower is more stable):
+  grid_spacing_k        CV=0.1823  ████              [STABLE]
+  gamma                 CV=0.4950  ██████████        [MODERATE]
+  ...
+
+Overall Robustness Score: 0.3012
+Interpretation: GOOD robustness — parameters generalise well
+```
+
+Interpretation of the robustness score:
+
+| Score | Interpretation |
+|-------|----------------|
+| `< 0.25` | **EXCELLENT** — parameters are very stable across top trials |
+| `< 0.40` | **GOOD** — parameters generalise well |
+| `≤ 0.50` | **ACCEPTABLE** — monitor live performance |
+| `> 0.50` | **WARNING** — likely overfitting, widen data or reduce params |
 
 ### Optimizable Parameters
 
 Defined in `OPTIMIZER_SPACE` in `config.py`:
 
-| Parameter | Type | Range |
-|-----------|------|-------|
-| `kama_period` | int | 5 – 30 |
-| `grid_spacing_k` | float | 0.5 – 3.0 |
-| `grid_levels` | int | 3 – 20 |
-| `gamma` | float | 0.1 – 2.0 |
-| `kappa` | float | 0.5 – 3.0 |
-| `order_pct` | float | 0.005 – 0.05 |
-| `atr_sl_mult` | float | 2.0 – 5.0 |
-| `regime_threshold` | float | 0.05 – 0.3 |
-| `er_trend_threshold` | float | 0.3 – 0.7 |
-| `trailing_enabled` | categorical | True, False |
-| `allow_short` | categorical | True, False |
-| `max_position_age_hours` | int | 6 – 72 |
-| `deviance_sigma` | float | 2.0 – 5.0 |
+| Parameter | Type | Range | Category |
+|-----------|------|-------|----------|
+| `grid_spacing_k` | float | 0.3 – 2.0 | Grid Structure |
+| `grid_levels` | int | 2 – 8 | Grid Structure |
+| `gamma` | float | 0.3 – 2.0 | Inventory Control |
+| `kappa` | float | 0.5 – 3.0 | Inventory Control |
+| `as_time_horizon` | float | 32 – 288 | Inventory Control |
+| `max_inventory_per_side` | int | 2 – 6 | Inventory Control |
+| `atr_sl_mult` | float | 2.0 – 5.0 | Risk Management |
+| `max_position_pct` | float | 0.3 – 0.7 | Risk Management |
+| `trailing_enabled` | categorical | True, False | Mode Switches |
+| `allow_short` | categorical | True, False | Mode Switches |
+
+Commented-out parameters in `OPTIMIZER_SPACE` are fixed at their `STRATEGY_PARAMS` values. Uncomment to include them in search.
 
 ### Persistence
 
-Optuna stores all trials in `grid_v4.db` (SQLite). You can:
+Optuna stores all trials in `grid_v4_wfo.db` (SQLite). You can:
 - Resume a study by using the same `--study-name`
-- Run multiple optimization sessions that accumulate knowledge
-- Delete `grid_v4.db` to start fresh
+- Run multiple sessions that accumulate knowledge
+- Delete `grid_v4_wfo.db` to start fresh
 
 ---
 
 ## Applying Optimized Parameters (apply_optimized_params.py)
 
-After optimization, apply the best parameters to `config.py`.
+After optimization, apply the robust parameters to `config.py`.
 
 ### Preview Changes (Dry Run)
 
@@ -366,18 +397,23 @@ python3 apply_optimized_params.py --preview
 
 Shows what would change without modifying any file.
 
-### Apply Changes
+### Apply Robust Parameters (Recommended)
 
 ```bash
-python3 apply_optimized_params.py
+# Apply from the robust JSON output (recommended)
+python3 apply_optimized_params.py --params data/optimizer_results_robust.json --key robust_params
 ```
 
-You will be asked to confirm before overwriting.
+### Apply Single-Best Parameters (Reference Only)
+
+```bash
+python3 apply_optimized_params.py --params data/best_params_v4.json
+```
 
 ### Auto-Confirm
 
 ```bash
-python3 apply_optimized_params.py --yes
+python3 apply_optimized_params.py --params data/optimizer_results_robust.json --key robust_params --yes
 ```
 
 Skips the confirmation prompt.
@@ -386,7 +422,8 @@ Skips the confirmation prompt.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--params` | string | `data/best_params_v4.json` | Path to optimized parameters JSON |
+| `--params` | string | `data/best_params_v4.json` | Path to parameters JSON |
+| `--key` | string | `best_params` | Key inside JSON to read params from |
 | `--config` | string | `config.py` | Path to config file to update |
 | `--preview` | flag | off | Dry run (show changes only) |
 | `--yes` / `-y` | flag | off | Auto-confirm changes |
@@ -620,7 +657,8 @@ from core.inventory import calculate_reservation_price, calculate_optimal_spread
 r = calculate_reservation_price(mid_price=50000, inventory_q=0.3, gamma=0.5, volatility=0.002)
 delta = calculate_optimal_spread(volatility=0.002, gamma=0.5, kappa=1.5)
 buy_sp, sell_sp, anchor = get_skewed_grid_params(
-    mid_price=50000, inventory_q=0.3, gamma=0.5, volatility=0.002, kappa=1.5)
+    mid_price=50000, inventory_q=0.3, gamma=0.5, volatility=0.002, kappa=1.5,
+    time_horizon=96.0)  # T=96 = 1 day; produces ~$2 skew at full inventory
 ```
 
 ```python
@@ -713,7 +751,7 @@ BACKTEST_CONFIG = {
 
 ### OPTIMIZER_SPACE
 
-Defines the parameter search space for Optuna. Each entry specifies a parameter name, type (`int`, `float`, or `cat`), and bounds.
+Defines the parameter search space for Optuna. Parameters are grouped by category for clarity. Commented-out entries are fixed at `STRATEGY_PARAMS` defaults.
 
 To add a new parameter to optimization:
 
@@ -724,7 +762,7 @@ OPTIMIZER_SPACE = {
 }
 ```
 
-To remove a parameter from optimization, delete or comment out its entry.
+To remove a parameter from optimization, comment out its entry.
 
 ---
 
@@ -791,8 +829,11 @@ Location: `data/charts/`
 
 ### Optimizer Output
 
-- `data/best_params_v4.json` — Best parameters from latest optimization
-- `grid_v4.db` — Optuna study database (SQLite, all trials stored)
+| File | Contents |
+|------|----------|
+| `data/optimizer_results_robust.json` | **Primary output** — robust params, param stability (CV), robustness score, OOS/MC results |
+| `data/best_params_v4.json` | Single-best trial params (reference only, may overfit) |
+| `grid_v4_wfo.db` | Optuna study database (SQLite, all trials stored) |
 
 ---
 
@@ -806,17 +847,21 @@ python3 main.py --coins BTC --start 2024-01-01
 # Review console output, charts in data/charts/, trades in data/output/
 ```
 
-### Workflow 2: Optimize and Apply
+### Workflow 2: Optimize and Apply (Robust)
 
 ```bash
 # Step 1: Run optimizer
 python3 optimizer.py --coins BTC ETH SOL --trials 200
 
-# Step 2: Preview changes
-python3 apply_optimized_params.py --preview
+# Step 2: Preview robust parameter changes
+python3 apply_optimized_params.py \
+    --params data/optimizer_results_robust.json \
+    --key robust_params --preview
 
 # Step 3: Apply if satisfied
-python3 apply_optimized_params.py
+python3 apply_optimized_params.py \
+    --params data/optimizer_results_robust.json \
+    --key robust_params
 
 # Step 4: Re-run backtest with optimized params
 python3 main.py --coins BTC ETH SOL --start 2024-01-01
@@ -907,7 +952,14 @@ Check:
 - Increase `--trials` (minimum 100 recommended)
 - Ensure sufficient data (at least 6 months per coin)
 - Try different `--windows` values (2-5)
-- Delete `grid_v4.db` and start fresh if previous study was with different data
+- Delete `grid_v4_wfo.db` and start fresh if previous study was with different data
+- Check the **Robustness Score** printed at the end — score > 0.50 means the parameter space is too wide
+
+### Too many PRUNE events in backtest output
+- `PRUNE_DEVIANCE` often: `deviance_sigma` is too tight — try increasing to 3.0+
+- `PRUNE_OLDEST` often: positions not resolving in time — try increasing `max_position_age_hours`
+- `PRUNE_GAP` often: `gap_prune_mult` is too small — try increasing to 3.0+
+- `PRUNE_FUNDING` often: `funding_cost_ratio` is too low — try increasing to 0.7+
 
 ### Charts not generating
 - Check `matplotlib` is installed: `pip install matplotlib`
@@ -916,4 +968,4 @@ Check:
 
 ---
 
-**Version**: V4.0 | **Date**: 2026-02-15
+**Version**: V4.1 | **Date**: 2026-02-19

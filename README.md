@@ -280,7 +280,7 @@ log_returns[j] = ln(Close_j / Close_{j-1})     for j in window
 sigma_t = std(log_returns)                       # Standard deviation of log returns
 ```
 
-This is the raw 15-minute sigma (not annualized) because the A-S model uses T=1.0 as a rolling horizon for perpetual futures.
+This is the raw 15-minute sigma (not annualized). The A-S model uses a rolling time horizon T (default 96 = 1 day of 15m bars) that scales inventory risk to a human-interpretable horizon.
 
 ---
 
@@ -357,7 +357,7 @@ Where:
 - `q` = normalized inventory, ranging from -1 (max short) to +1 (max long)
 - `gamma` = risk aversion parameter (0.1 to 2.0)
 - `sigma` = rolling standard deviation of 15m log returns
-- `T` = time horizon (1.0 for perpetuals, representing a rolling window)
+- `T` = time horizon in 15m bars (default 96 = 1 day). Controls how strongly inventory risk is penalized — larger T means bigger skew per unit of inventory.
 
 **How it works**: When `q > 0` (we hold long inventory), `r < s`. The grid anchor drops below market price. This means:
 - Buy levels move further below price (we're less eager to add longs)
@@ -443,10 +443,11 @@ An in-memory order book that manages all pending grid orders. Orders are tagged 
 - `reduce_only`: Whether this is a take-profit order (can only reduce position)
 
 The order book is regenerated when:
-- A fill occurs (grid needs re-centering)
-- Regime changes
+- **A fill occurs AND price has drifted >1 grid spacing from the anchor** (preserves queue position for unfilled levels)
+- Regime changes between bars
 - Circuit breaker halts/resumes
 - Trailing up shifts the anchor
+- Stop loss or pruning closes a position
 
 ---
 
@@ -504,16 +505,25 @@ Every trade is tagged with a descriptive label:
 
 **File**: `engine/strategy.py` | **Method**: `_check_stop_loss()`
 
-Each side has an independent ATR-based stop:
+Each side has an independent ATR-based stop using a **two-stage mechanism**:
 
+**Stage 1** (multi-fill positions — closes 50%):
 ```
-Long stop:  avg_entry - atr_sl_mult * ATR
-Short stop: avg_entry + atr_sl_mult * ATR
+Long stop:  avg_entry - atr_sl_mult * ATR    → close 50% of position
+Short stop: avg_entry + atr_sl_mult * ATR    → close 50% of position
 ```
 
-If the candle's Low (for longs) or High (for shorts) touches the stop level, the entire side is closed at the stop price.
+**Stage 2** (remainder or single-fill positions — closes 100%):
+```
+Long stop:  avg_entry - 1.5 * atr_sl_mult * ATR    → close remaining position
+Short stop: avg_entry + 1.5 * atr_sl_mult * ATR    → close remaining position
+```
 
-**Default**: `atr_sl_mult = 3.5` (3.5x ATR distance from entry)
+A single-fill position always closes 100% at Stage 1 (no point splitting one fill).
+
+This prevents the pattern of accumulating several fills then losing them all in a single stop event. Stage 1 reduces risk immediately; Stage 2 gives the remaining position room to recover before closing.
+
+**Default**: `atr_sl_mult = 3.0` (3.0x ATR for first stage, 4.5x for second stage)
 
 ---
 
@@ -651,8 +661,10 @@ For every bar from index 1 to N:
                        If halted and Z > -1.0: set halted=False, regen grid
                        If halted: update equity, skip to next bar
 
-3. STOP LOSS           Long: if Low <= entry - 3.5*ATR, close all longs
-                       Short: if High >= entry + 3.5*ATR, close all shorts
+3. STOP LOSS           Long: if Low <= entry - atr_sl_mult*ATR:
+                           Multi-fill: close 50%, widen stop to 1.5x
+                           Single fill: close 100%
+                       Short: symmetric
 
 4. LIQUIDATION         If leveraged: check if price hit liquidation level
                        Close position at market if liquidated
@@ -666,11 +678,14 @@ For every bar from index 1 to N:
 7. VaR CHECK           Calculate total exposure VaR
                        If VaR > 15% of equity, block new orders
 
-8. GRID GENERATION     Cancel old orders
-                       Calculate A-S reservation price and spread
-                       Place buy entries + sell TPs for long grid
-                       Place sell entries + buy TPs for short grid
-                       Filter by regime (no longs in downtrend, etc.)
+8. GRID GENERATION     If grid_needs_regen flag set AND VaR allows:
+                         Cancel old orders
+                         Calculate A-S reservation price (T=96, real skew)
+                         Place buy entries + sell TPs for long grid
+                         Place sell entries + buy TPs for short grid
+                         Filter by regime (no longs in downtrend, etc.)
+                       Flag is set on: stop/prune/trailing/CB-resume OR
+                         fill + price drifted >1 spacing from anchor
 
 9. FILL MATCHING       Check each pending order against bar's High/Low
                        Process fills: update position, track PnL

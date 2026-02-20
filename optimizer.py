@@ -15,6 +15,7 @@ Usage:
   python3 optimizer.py --coins BTC ETH SOL --trials 200 --windows 4
 """
 import optuna
+from optuna.trial import TrialState
 import numpy as np
 import pandas as pd
 import argparse
@@ -429,6 +430,79 @@ def monte_carlo_validation(best_params, n_permutations=50, verbose=True):
     return p_value < 0.05, p_value
 
 
+# ─── Robust Parameter Selection ─────────────────────────────
+
+TOP_PERCENT = 0.10  # Top 10% of trials used for robust selection
+
+
+def compute_robust_parameters(study, optimizer_space: dict) -> tuple:
+    """
+    Institutional-grade robust parameter cluster selection.
+
+    Instead of picking the single best trial (which overfits), this function:
+      1. Takes the top-N% of completed trials by objective value.
+      2. Computes the MEDIAN of each parameter across those top trials.
+      3. Measures parameter stability via Coefficient of Variation (CV).
+      4. Returns an overall robustness score (lower CV = more robust).
+
+    Returns:
+        robust_params    : dict of parameter name -> robust (median) value
+        param_stability  : dict of parameter name -> CV (std/mean)
+        robustness_score : float, mean CV across all params (lower = better)
+    """
+    # Step 1: Extract completed trials with valid scores
+    completed_trials = [
+        t for t in study.trials
+        if t.state == TrialState.COMPLETE and t.value is not None
+    ]
+
+    if not completed_trials:
+        return {}, {}, 1.0
+
+    # Step 2: Sort by objective value descending
+    sorted_trials = sorted(completed_trials, key=lambda t: t.value, reverse=True)
+
+    # Step 3: Select top N%
+    top_n = max(5, int(len(sorted_trials) * TOP_PERCENT))
+    top_trials = sorted_trials[:top_n]
+
+    robust_params = {}
+    param_stability = {}
+
+    # Step 4 & 5: Compute median and CV for each param
+    for param_name, spec in optimizer_space.items():
+        values = [t.params[param_name] for t in top_trials if param_name in t.params]
+        if not values:
+            continue
+
+        arr = np.array(values, dtype=float)
+        median_val = float(np.median(arr))
+
+        # Round to int for integer params
+        if spec['type'] == 'int':
+            median_val = int(round(median_val))
+        elif spec['type'] == 'cat':
+            # For categorical, pick the most common value in top trials
+            median_val = max(set(values), key=values.count)
+
+        robust_params[param_name] = median_val
+
+        # CV (only meaningful for numeric)
+        if spec['type'] in ('int', 'float'):
+            cv = float(np.std(arr) / (np.mean(arr) + 1e-9))
+        else:
+            # Categorical: stability = fraction that agree on the modal choice
+            modal_count = max(values.count(v) for v in set(values))
+            cv = 1.0 - (modal_count / max(len(values), 1))
+        param_stability[param_name] = round(cv, 4)
+
+    # Step 6: Overall robustness score
+    cv_values = list(param_stability.values())
+    robustness_score = float(np.mean(cv_values)) if cv_values else 1.0
+
+    return robust_params, param_stability, robustness_score
+
+
 # ─── Main ────────────────────────────────────────────────────
 
 def main():
@@ -507,12 +581,11 @@ def main():
                    show_progress_bar=True)
     elapsed = time.time() - start_time
 
-    # ─── Results ─────────────────────────────────────────────
+    # ─── Results: Best Single Trial ──────────────────────────
     print(f"\n{'='*60}")
-    print(f"  Best Parameters (Train MIN Score: {study.best_value:.4f})")
+    print(f"  Best Single Trial (Train MIN Score: {study.best_value:.4f})")
     print(f"  Completed in {elapsed/60:.1f} minutes")
     print(f"{'='*60}")
-
     for k, v in sorted(study.best_params.items()):
         default = STRATEGY_PARAMS.get(k, '—')
         if isinstance(v, float):
@@ -535,9 +608,63 @@ def main():
         print(f"    Test MIN:     {best_trial.user_attrs.get('test_min', 'N/A')}")
         print(f"    Test MEAN:    {best_trial.user_attrs.get('test_mean', 'N/A')}")
 
-    # Save best params
+    # ─── Robust Parameter Cluster Selection ──────────────────
+    completed_count = sum(
+        1 for t in study.trials if t.state == TrialState.COMPLETE)
+    top_n_used = max(5, int(completed_count * TOP_PERCENT))
+
+    robust_params, param_stability, robustness_score = compute_robust_parameters(
+        study, OPTIMIZER_SPACE)
+
+    # Step 8: Print Robust Parameter Report
+    print(f"\n{'='*60}")
+    print(f"  ===== ROBUST PARAMETER REPORT =====")
+    print(f"  (Top {TOP_PERCENT*100:.0f}% of {completed_count} trials = {top_n_used} trials used)")
+    print(f"{'='*60}")
+
+    print(f"\n  Robust Parameters (median of top cluster):")
+    for k, v in sorted(robust_params.items()):
+        default = STRATEGY_PARAMS.get(k, '—')
+        if isinstance(v, float):
+            print(f"    {k:<28} {v:>8.4f}  (default: {default})")
+        else:
+            print(f"    {k:<28} {v!s:>8}  (default: {default})")
+
+    print(f"\n  Parameter Stability (CV — lower is more stable):")
+    for k, cv in sorted(param_stability.items()):
+        bar = '█' * max(1, int(cv * 20))
+        stability = 'STABLE' if cv < 0.25 else ('MODERATE' if cv < 0.50 else 'UNSTABLE')
+        print(f"    {k:<28} CV={cv:.4f}  {bar:<20}  [{stability}]")
+
+    print(f"\n  Overall Robustness Score: {robustness_score:.4f}")
+    if robustness_score < 0.25:
+        print(f"  Interpretation: EXCELLENT robustness — parameters are highly stable")
+    elif robustness_score < 0.40:
+        print(f"  Interpretation: GOOD robustness — parameters generalise well")
+    elif robustness_score <= 0.50:
+        print(f"  Interpretation: ACCEPTABLE robustness — monitor live performance")
+    else:
+        print(f"  Interpretation: WARNING: likely overfitting — widen data or reduce params")
+    print(f"{'='*60}")
+
+    # Step 7: Save robust results to JSON
     os.makedirs('data', exist_ok=True)
-    output = {
+    robust_output = {
+        'robust_params': robust_params,
+        'param_stability': param_stability,
+        'robustness_score': round(robustness_score, 6),
+        'num_trials': completed_count,
+        'top_trials_used': top_n_used,
+        'best_single_trial_score': study.best_value,
+        'n_windows': N_WINDOWS,
+        'coins': list(CACHED_DATA.keys()),
+    }
+    with open('data/optimizer_results_robust.json', 'w') as f:
+        json.dump(robust_output, f, indent=4, default=str)
+    print(f"  Saved robust results to data/optimizer_results_robust.json")
+
+    # Also save best single trial params for comparison
+    legacy_output = {
         'best_params': study.best_params,
         'train_min_score': study.best_value,
         'train_scores': train_scores,
@@ -547,37 +674,41 @@ def main():
         'coins': list(CACHED_DATA.keys()),
     }
     with open('data/best_params_v4.json', 'w') as f:
-        json.dump(output, f, indent=4)
-    print(f"\n  Saved to data/best_params_v4.json")
+        json.dump(legacy_output, f, indent=4)
+    print(f"  Saved single-best params to data/best_params_v4.json")
 
-    # ─── OOS Validation ──────────────────────────────────────
-    best_params = study.best_params
-    oos_pass, oos_results = validate_oos(best_params, verbose=True)
+    # ─── OOS Validation (uses ROBUST params) ─────────────────
+    # Use robust_params as the final output — more conservative and
+    # generalised than the single best trial.
+    final_params = robust_params if robust_params else study.best_params
+    oos_pass, oos_results = validate_oos(final_params, verbose=True)
 
     # ─── Monte Carlo Validation ──────────────────────────────
     if not args.skip_mc and args.mc_perms > 0:
         mc_sig, mc_p = monte_carlo_validation(
-            best_params, n_permutations=args.mc_perms, verbose=True)
-        output['mc_significant'] = mc_sig
-        output['mc_p_value'] = mc_p
+            final_params, n_permutations=args.mc_perms, verbose=True)
+        robust_output['mc_significant'] = mc_sig
+        robust_output['mc_p_value'] = mc_p
     else:
         print(f"\n  Skipping Monte Carlo validation (use --mc-perms N to enable)")
 
-    output['oos_pass'] = oos_pass
-    with open('data/best_params_v4.json', 'w') as f:
-        json.dump(output, f, indent=4, default=str)
+    robust_output['oos_pass'] = oos_pass
+    with open('data/optimizer_results_robust.json', 'w') as f:
+        json.dump(robust_output, f, indent=4, default=str)
 
     # ─── Final Summary ───────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"  OPTIMIZATION COMPLETE")
     print(f"{'='*60}")
-    print(f"  Trials:     {args.trials}")
-    print(f"  Best Train: {study.best_value:.4f}")
-    print(f"  OOS Pass:   {'✅ YES' if oos_pass else '❌ NO'}")
+    print(f"  Trials:            {args.trials}")
+    print(f"  Best Single Train: {study.best_value:.4f}")
+    print(f"  Robustness Score:  {robustness_score:.4f}")
+    print(f"  OOS Pass:          {'✅ YES' if oos_pass else '❌ NO'}")
     if not args.skip_mc and args.mc_perms > 0:
-        print(f"  MC Signif:  {'✅ YES' if output.get('mc_significant') else '❌ NO'} "
-              f"(p={output.get('mc_p_value', 'N/A')})")
-    print(f"  Saved:      data/best_params_v4.json")
+        print(f"  MC Signif:         {'✅ YES' if robust_output.get('mc_significant') else '❌ NO'} "
+              f"(p={robust_output.get('mc_p_value', 'N/A')})")
+    print(f"  Robust Params:     data/optimizer_results_robust.json")
+    print(f"  Single-Best Params: data/best_params_v4.json")
     print(f"{'='*60}")
 
 

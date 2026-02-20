@@ -67,6 +67,12 @@ class LiveRunner:
         self.grid_anchor_long = 0.0
         self.grid_anchor_short = 0.0
         self.trailing_anchor = 0.0
+        self._last_grid_spacing = 0.0
+        self._prev_regime = 0
+
+        # Partial stop loss state: tracks if first-stage stop already fired
+        self._partial_stop_fired_long = False
+        self._partial_stop_fired_short = False
 
         # Accumulated profit for offset pruning
         self.accumulated_profit_long = 0.0
@@ -591,7 +597,17 @@ class LiveRunner:
             self.trade_logger.log_trade(trade)
             self.state.save_trade(trade)
 
-        self.grid_needs_regen = True
+        # Smart grid regen: only set flag if price drifted >1 spacing from
+        # anchor or regime changed.  Avoids cancel-and-replace churn that
+        # kills queue position on every fill.
+        if self._last_grid_spacing > 0:
+            anchor_drift_long = abs(fill_price - self.grid_anchor_long)
+            anchor_drift_short = abs(fill_price - self.grid_anchor_short)
+            if anchor_drift_long > self._last_grid_spacing or anchor_drift_short > self._last_grid_spacing:
+                self.grid_needs_regen = True
+        else:
+            # First run or spacing not yet computed — always regen
+            self.grid_needs_regen = True
 
     def _reconcile_positions(self, exchange_positions: dict):
         """Adjust internal tracker if exchange shows different position size."""
@@ -698,46 +714,102 @@ class LiveRunner:
             self._log_equity_bar(cur_time, cur_close, prev_regime)
             return
 
-        # ─── 3. STOP LOSS (ATR-based) ────────────────────────
+        # ─── 3. STOP LOSS (ATR-based, partial) ────────────────
+        # Partial stop: multi-fill positions close 50% first, then full
+        # close at wider stop (1.5× mult). Single-fill = 100% close.
         if self.pos_long.is_open:
-            stop_price = self.pos_long.avg_entry - atr_sl_mult * prev_atr
+            effective_mult = atr_sl_mult * 1.5 if self._partial_stop_fired_long else atr_sl_mult
+            stop_price = self.pos_long.avg_entry - effective_mult * prev_atr
             if cur_low <= stop_price:
-                logger.info(f"STOP LOSS LONG triggered: low={cur_low:.2f} <= stop={stop_price:.2f}")
-                order = self.executor.place_market_order(
-                    self.symbol, 'sell', self.pos_long.size,
-                    'LONG', reduce_only=True)
-                if order is None:
-                    logger.warning(f"Stop loss market order failed for LONG "
-                                   f"(size={self.pos_long.size}), skipping internal close")
+                if self.pos_long.num_fills > 1 and not self._partial_stop_fired_long:
+                    # Stage 1: close 50%
+                    close_qty = self.pos_long.size * 0.5
+                    logger.info(f"PARTIAL STOP LONG (50%): low={cur_low:.2f} <= stop={stop_price:.2f}, "
+                                f"closing {close_qty:.6f} of {self.pos_long.size:.6f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'sell', close_qty,
+                        'LONG', reduce_only=True)
+                    if order is None:
+                        logger.warning(f"Partial stop loss market order failed for LONG")
+                    else:
+                        actual_price = float(order.get('average', stop_price) or stop_price)
+                        fee = close_qty * actual_price * fee_rate
+                        pnl = self.pos_long.close_fill(actual_price, close_qty, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_long'] += 1
+                        self._partial_stop_fired_long = True
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            cur_time, actual_price, close_qty, LABEL_STOP_LONG, prev_regime, pnl)
                 else:
-                    actual_price = float(order.get('average', stop_price) or stop_price)
-                    fee = self.pos_long.size * actual_price * fee_rate
-                    pnl = self.pos_long.close_all(actual_price, fee)
-                    self.wallet_balance += pnl
-                    self.metrics['stops_long'] += 1
-                    self.grid_needs_regen = True
-                    self._log_trade_event(
-                        cur_time, actual_price, 0, LABEL_STOP_LONG, prev_regime, pnl)
+                    # Stage 2 (or single fill): close everything
+                    logger.info(f"STOP LOSS LONG triggered: low={cur_low:.2f} <= stop={stop_price:.2f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'sell', self.pos_long.size,
+                        'LONG', reduce_only=True)
+                    if order is None:
+                        logger.warning(f"Stop loss market order failed for LONG "
+                                       f"(size={self.pos_long.size}), skipping internal close")
+                    else:
+                        actual_price = float(order.get('average', stop_price) or stop_price)
+                        fee = self.pos_long.size * actual_price * fee_rate
+                        pnl = self.pos_long.close_all(actual_price, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_long'] += 1
+                        self._partial_stop_fired_long = False
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            cur_time, actual_price, 0, LABEL_STOP_LONG, prev_regime, pnl)
+
+        if not self.pos_long.is_open:
+            self._partial_stop_fired_long = False
 
         if self.pos_short.is_open:
-            stop_price = self.pos_short.avg_entry + atr_sl_mult * prev_atr
+            effective_mult = atr_sl_mult * 1.5 if self._partial_stop_fired_short else atr_sl_mult
+            stop_price = self.pos_short.avg_entry + effective_mult * prev_atr
             if cur_high >= stop_price:
-                logger.info(f"STOP LOSS SHORT triggered: high={cur_high:.2f} >= stop={stop_price:.2f}")
-                order = self.executor.place_market_order(
-                    self.symbol, 'buy', self.pos_short.size,
-                    'SHORT', reduce_only=True)
-                if order is None:
-                    logger.warning(f"Stop loss market order failed for SHORT "
-                                   f"(size={self.pos_short.size}), skipping internal close")
+                if self.pos_short.num_fills > 1 and not self._partial_stop_fired_short:
+                    # Stage 1: close 50%
+                    close_qty = self.pos_short.size * 0.5
+                    logger.info(f"PARTIAL STOP SHORT (50%): high={cur_high:.2f} >= stop={stop_price:.2f}, "
+                                f"closing {close_qty:.6f} of {self.pos_short.size:.6f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'buy', close_qty,
+                        'SHORT', reduce_only=True)
+                    if order is None:
+                        logger.warning(f"Partial stop loss market order failed for SHORT")
+                    else:
+                        actual_price = float(order.get('average', stop_price) or stop_price)
+                        fee = close_qty * actual_price * fee_rate
+                        pnl = self.pos_short.close_fill(actual_price, close_qty, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_short'] += 1
+                        self._partial_stop_fired_short = True
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            cur_time, actual_price, close_qty, LABEL_STOP_SHORT, prev_regime, pnl)
                 else:
-                    actual_price = float(order.get('average', stop_price) or stop_price)
-                    fee = self.pos_short.size * actual_price * fee_rate
-                    pnl = self.pos_short.close_all(actual_price, fee)
-                    self.wallet_balance += pnl
-                    self.metrics['stops_short'] += 1
-                    self.grid_needs_regen = True
-                    self._log_trade_event(
-                        cur_time, actual_price, 0, LABEL_STOP_SHORT, prev_regime, pnl)
+                    # Stage 2 (or single fill): close everything
+                    logger.info(f"STOP LOSS SHORT triggered: high={cur_high:.2f} >= stop={stop_price:.2f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'buy', self.pos_short.size,
+                        'SHORT', reduce_only=True)
+                    if order is None:
+                        logger.warning(f"Stop loss market order failed for SHORT "
+                                       f"(size={self.pos_short.size}), skipping internal close")
+                    else:
+                        actual_price = float(order.get('average', stop_price) or stop_price)
+                        fee = self.pos_short.size * actual_price * fee_rate
+                        pnl = self.pos_short.close_all(actual_price, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_short'] += 1
+                        self._partial_stop_fired_short = False
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            cur_time, actual_price, 0, LABEL_STOP_SHORT, prev_regime, pnl)
+
+        if not self.pos_short.is_open:
+            self._partial_stop_fired_short = False
 
         # ─── 4. LIQUIDATION CHECK ────────────────────────────
         if self.pos_long.is_open and leverage > 1.0:
@@ -865,11 +937,15 @@ class LiveRunner:
             funding_rate = self.executor.get_funding_rate(self.symbol)
             long_bias, short_bias = should_bias_for_funding(prev_regime, funding_rate)
 
+            # Read A-S time horizon from config (default 96 = 1 day of 15m bars)
+            as_time_horizon = self.config.get('as_time_horizon', 96.0)
+
             self._place_grid_on_exchange(
                 cur_close, prev_atr, prev_vol, prev_regime, funding_rate,
                 cur_time, grid_levels, spacing_k, spacing_floor,
                 gamma, kappa, order_pct, leverage, max_inv_per_side,
-                max_position_pct, allow_short, long_bias, short_bias)
+                max_position_pct, allow_short, long_bias, short_bias,
+                as_time_horizon)
 
             # ─── 8b. EXCHANGE-SIDE STOP LOSS (STOP_MARKET) ─────
             # Places STOP_MARKET orders on Binance so stops execute
@@ -961,9 +1037,11 @@ class LiveRunner:
                                  timestamp, grid_levels, spacing_k, spacing_floor,
                                  gamma, kappa, order_pct, leverage,
                                  max_inv_per_side, max_position_pct, allow_short,
-                                 long_bias, short_bias):
+                                 long_bias, short_bias,
+                                 as_time_horizon=96.0):
         """Generate and place grid orders on exchange."""
         base_spacing = calculate_dynamic_spacing(atr, spacing_k, spacing_floor, price)
+        self._last_grid_spacing = base_spacing
 
         # ─── LONG GRID ──────────────────────────────────────
         can_open_long_entry = regime not in (REGIME_DOWNTREND, REGIME_BREAKOUT_DOWN)
@@ -973,7 +1051,8 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp, sell_sp, anchor_long = get_skewed_grid_params(
             price, inv_q_long, gamma, vol, kappa,
-            base_spacing, base_spacing)
+            base_spacing, base_spacing,
+            time_horizon=as_time_horizon)
 
         self.grid_anchor_long = anchor_long
         buy_levels, sell_levels = generate_grid_levels(
@@ -1064,7 +1143,8 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp_s, sell_sp_s, anchor_short = get_skewed_grid_params(
             price, inv_q_short, gamma, vol, kappa,
-            base_spacing, base_spacing)
+            base_spacing, base_spacing,
+            time_horizon=as_time_horizon)
 
         self.grid_anchor_short = anchor_short
         buy_levels_s, sell_levels_s = generate_grid_levels(
