@@ -113,7 +113,7 @@ BACKTEST_FILL_CONF = {
 OPTIMIZER_SPACE = {
     # ─── Grid Structure (core profitability) ──────────────────
     'grid_spacing_k':   {'type': 'float', 'low': 0.3,  'high': 2.0},   # ATR multiplier for spacing
- #   'spacing_floor':    {'type': 'float', 'low': 0.003, 'high': 0.009}, # Min spacing (% of price)
+    'spacing_floor':    {'type': 'float', 'low': 0.003, 'high': 0.009}, # Min spacing (% of price)
     'grid_levels':      {'type': 'int',   'low': 2,    'high': 8},      # Levels per side (was 3-20, too wide)
  #   'order_pct':        {'type': 'float', 'low': 0.01, 'high': 0.06},   # Order size as % of capital
 
@@ -133,11 +133,11 @@ OPTIMIZER_SPACE = {
 
     # ─── Pruning ──────────────────────────────────────────────
  #   'max_position_age_hours': {'type': 'int', 'low': 6, 'high': 48},    # Max fill age (was 6-72, too wide)
- #   'deviance_sigma':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Deviance pruning threshold
-#    'gap_prune_mult':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Gap pruning threshold
+    'deviance_sigma':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Deviance pruning threshold
+    'gap_prune_mult':   {'type': 'float', 'low': 2.0,  'high': 5.0},    # Gap pruning threshold
  #   'funding_cost_ratio':{'type': 'float', 'low': 0.3,  'high': 0.8},   # Funding pruning threshold
 
     # ─── Mode Switches ────────────────────────────────────────
     'trailing_enabled': {'type': 'cat',   'choices': [True, False]},
-    'allow_short':      {'type': 'cat',   'choices': [True, False]},
+ #   'allow_short':      {'type': 'cat',   'choices': [True, False]},
 }

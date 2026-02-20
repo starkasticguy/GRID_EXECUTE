@@ -26,6 +26,7 @@ from live.runner import LiveRunner
 from live.state import StateManager
 from live.logger import TradeLogger
 from live.monitor import HealthMonitor
+from live.telegram_notifier import TelegramNotifier, fmt_stop
 
 
 def main():
@@ -78,8 +79,10 @@ Examples:
 
     # ─── API Keys ──────────────────────────────────────────────
     load_dotenv()  # Load .env file into environment (must be before os.environ.get)
-    api_key = os.environ.get('BINANCE_API_KEY', '')
+    api_key    = os.environ.get('BINANCE_API_KEY', '')
     api_secret = os.environ.get('BINANCE_API_SECRET', '')
+    tg_token   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+    tg_chat    = os.environ.get('TELEGRAM_CHAT_ID', '')
 
     if not api_key or not api_secret:
         if not args.dry_run:
@@ -151,6 +154,13 @@ Examples:
 
     health_monitor = HealthMonitor(live_config, initial_equity)
 
+    # ─── Telegram Notifier ─────────────────────────────────────
+    tg = TelegramNotifier(token=tg_token, chat_id=tg_chat)
+    if tg.enabled:
+        print(f"  Telegram: notifications enabled (chat {tg_chat})")
+    else:
+        print("  Telegram: disabled (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env)")
+
     # ─── Create Runner ─────────────────────────────────────────
     runner = LiveRunner(
         executor=executor,
@@ -160,12 +170,15 @@ Examples:
         state_manager=state_mgr,
         trade_logger=trade_logger,
         health_monitor=health_monitor,
+        telegram=tg,
     )
 
     # ─── Signal Handlers ───────────────────────────────────────
     def handle_signal(signum, frame):
         sig_name = signal.Signals(signum).name
         print(f"\nReceived {sig_name}, initiating graceful shutdown...")
+        if tg.enabled:
+            tg.send_now(fmt_stop(symbol, reason=sig_name))
         runner.shutdown()
 
     signal.signal(signal.SIGINT, handle_signal)

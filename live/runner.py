@@ -39,6 +39,10 @@ from live.executor import BinanceExecutor
 from live.state import StateManager
 from live.logger import TradeLogger
 from live.monitor import HealthMonitor
+from live.telegram_notifier import (
+    TelegramNotifier, fmt_start, fmt_stop, fmt_trade,
+    fmt_bar_summary, fmt_equity_warning,
+)
 
 logger = logging.getLogger('live_runner')
 
@@ -48,7 +52,8 @@ class LiveRunner:
     def __init__(self, executor: BinanceExecutor, symbol: str,
                  strategy_config: dict, live_config: dict,
                  state_manager: StateManager, trade_logger: TradeLogger,
-                 health_monitor: HealthMonitor):
+                 health_monitor: HealthMonitor,
+                 telegram: TelegramNotifier | None = None):
         self.executor = executor
         self.symbol = symbol
         self.config = strategy_config
@@ -56,6 +61,7 @@ class LiveRunner:
         self.state = state_manager
         self.trade_logger = trade_logger
         self.monitor = health_monitor
+        self.tg = telegram  # TelegramNotifier (None = disabled)
 
         # Core state (mirrors backtest GridStrategyV4)
         self.initial_capital = strategy_config['initial_capital']
@@ -241,6 +247,12 @@ class LiveRunner:
         self._running = True
         logger.info(f"LiveRunner started for {self.symbol}")
 
+        # Telegram: announce startup
+        if self.tg:
+            leverage = self.config.get('leverage', 1.0)
+            mode = 'LIVE' if not self.live_config.get('dry_run') else 'DRY-RUN'
+            self.tg.send_now(fmt_start(self.symbol, self.wallet_balance, leverage, mode))
+
         while self._running:
             try:
                 # 1. Wait for new bar
@@ -303,8 +315,33 @@ class LiveRunner:
                 eq_status = self.monitor.check_equity(total_equity)
                 if eq_status == 'critical':
                     logger.critical("Emergency equity threshold breached!")
+                    if self.tg:
+                        self.tg.send(
+                            f'💀 <b>CRITICAL EQUITY BREACH</b> — emergency shutdown\n'
+                            f'Symbol: <code>{self.symbol}</code>\n'
+                            f'Equity: <code>${total_equity:,.2f}</code>')
                     self.emergency_shutdown()
                     break
+                elif eq_status == 'warning' and self.tg:
+                    peak = self.monitor.peak_equity
+                    dd = (peak - total_equity) / peak * 100 if peak > 0 else 0
+                    self.tg.send(fmt_equity_warning(self.symbol, total_equity, peak, dd))
+
+                # Telegram: periodic bar heartbeat every 4 bars (silent, no notification sound)
+                if self.tg and self.bar_count % 4 == 0:
+                    regime_str = {
+                        0: 'NOISE', 1: 'UPTREND', -1: 'DOWNTREND',
+                        2: 'BREAKOUT_UP', -2: 'BREAKOUT_DOWN',
+                    }.get(self._last_regime, str(self._last_regime))
+                    long_s = (f"{self.pos_long.size:.4f}@{self.pos_long.avg_entry:.2f}"
+                              if self.pos_long.is_open else 'flat')
+                    short_s = (f"{self.pos_short.size:.4f}@{self.pos_short.avg_entry:.2f}"
+                               if self.pos_short.is_open else 'flat')
+                    self.tg.send(
+                        fmt_bar_summary(self.symbol, cur_price, regime_str,
+                                        total_equity, long_s, short_s,
+                                        self.grid_needs_regen),
+                        silent=True)  # silent = no ding
 
                 self.bar_count += 1
 
@@ -335,10 +372,20 @@ class LiveRunner:
         wait_s = (next_bar_close - now_ms) / 1000.0 + grace_s
         if wait_s > 0:
             logger.info(f"Waiting {wait_s:.0f}s for next 15m bar close...")
-            # Sleep in chunks so we can respond to shutdown
+            # Sleep in chunks so we can respond to shutdown and run mid-candle checks
+            intracandle_interval = self.live_config.get('intracandle_check_seconds', 300)  # 5 min
             end_time = time.time() + wait_s
+            last_check_t = time.time()
             while time.time() < end_time and self._running:
                 time.sleep(max(0, min(poll_s, end_time - time.time())))
+                # Fire mid-candle check every 5 min (but not right before bar close)
+                now = time.time()
+                if now - last_check_t >= intracandle_interval and (end_time - now) > poll_s:
+                    try:
+                        self._intracandle_check()
+                    except Exception as e:
+                        logger.warning(f"Intracandle check error: {e}")
+                    last_check_t = now
 
         if not self._running:
             return None
@@ -380,6 +427,131 @@ class LiveRunner:
         # Trim to buffer size
         if len(self.candle_buffer) > self.buffer_size:
             self.candle_buffer = self.candle_buffer.iloc[-self.buffer_size:].reset_index(drop=True)
+
+    def _intracandle_check(self):
+        """Mid-candle lightweight check: fill sync + stop loss only.
+
+        Runs every 5 minutes during the inter-bar wait period.
+        Does NOT recompute indicators or regenerate the grid.
+        Provides faster stop loss reaction on intrabar crash moves.
+        """
+        # 1. Sync fills from exchange so positions are up to date
+        try:
+            self._sync_exchange_state()
+            self._sync_conditional_orders()
+        except Exception as e:
+            logger.debug(f"Intracandle fill sync error: {e}")
+
+        # Skip stop checks if no open positions
+        if not self.pos_long.is_open and not self.pos_short.is_open:
+            return
+
+        # 2. Get current live price
+        try:
+            ticker = self.executor.get_ticker(self.symbol)
+            cur_price = float(ticker.get('last') or ticker.get('close') or 0)
+            if cur_price <= 0:
+                return
+        except Exception as e:
+            logger.debug(f"Intracandle ticker fetch failed: {e}")
+            return
+
+        # 3. Get last known ATR from candle buffer
+        if self.candle_buffer is None or len(self.candle_buffer) < 20:
+            return
+        closes = self.candle_buffer['close'].values.astype(np.float64)
+        highs = self.candle_buffer['high'].values.astype(np.float64)
+        lows = self.candle_buffer['low'].values.astype(np.float64)
+        atr_arr = calculate_atr(highs, lows, closes, self.config['atr_period'])
+        cur_atr = float(atr_arr[-1])
+        if cur_atr <= 0:
+            return
+
+        atr_sl_mult = self.config.get('atr_sl_mult', 3.0)
+        fee_rate = self.config.get('fee_taker', 0.0005)
+
+        # 4. Check long stop
+        if self.pos_long.is_open:
+            effective_mult = atr_sl_mult * 1.5 if self._partial_stop_fired_long else atr_sl_mult
+            stop_price = self.pos_long.avg_entry - effective_mult * cur_atr
+            if cur_price <= stop_price:
+                if self.pos_long.num_fills > 1 and not self._partial_stop_fired_long:
+                    close_qty = self.pos_long.size * 0.5
+                    logger.info(f"[INTRACANDLE] PARTIAL STOP LONG: price={cur_price:.2f} <= stop={stop_price:.2f}, "
+                                f"closing {close_qty:.6f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'sell', close_qty, 'LONG', reduce_only=True)
+                    if order:
+                        actual = float(order.get('average', cur_price) or cur_price)
+                        fee = close_qty * actual * fee_rate
+                        pnl = self.pos_long.close_fill(actual, close_qty, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_long'] += 1
+                        self._partial_stop_fired_long = True
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            int(time.time() * 1000), actual, close_qty,
+                            LABEL_STOP_LONG, self._last_regime, pnl)
+                else:
+                    logger.info(f"[INTRACANDLE] STOP LOSS LONG: price={cur_price:.2f} <= stop={stop_price:.2f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'sell', self.pos_long.size, 'LONG', reduce_only=True)
+                    if order:
+                        actual = float(order.get('average', cur_price) or cur_price)
+                        fee = self.pos_long.size * actual * fee_rate
+                        pnl = self.pos_long.close_all(actual, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_long'] += 1
+                        self._partial_stop_fired_long = False
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            int(time.time() * 1000), actual, 0,
+                            LABEL_STOP_LONG, self._last_regime, pnl)
+
+        if not self.pos_long.is_open:
+            self._partial_stop_fired_long = False
+
+        # 5. Check short stop
+        if self.pos_short.is_open:
+            effective_mult = atr_sl_mult * 1.5 if self._partial_stop_fired_short else atr_sl_mult
+            stop_price = self.pos_short.avg_entry + effective_mult * cur_atr
+            if cur_price >= stop_price:
+                if self.pos_short.num_fills > 1 and not self._partial_stop_fired_short:
+                    close_qty = self.pos_short.size * 0.5
+                    logger.info(f"[INTRACANDLE] PARTIAL STOP SHORT: price={cur_price:.2f} >= stop={stop_price:.2f}, "
+                                f"closing {close_qty:.6f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'buy', close_qty, 'SHORT', reduce_only=True)
+                    if order:
+                        actual = float(order.get('average', cur_price) or cur_price)
+                        fee = close_qty * actual * fee_rate
+                        pnl = self.pos_short.close_fill(actual, close_qty, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_short'] += 1
+                        self._partial_stop_fired_short = True
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            int(time.time() * 1000), actual, close_qty,
+                            LABEL_STOP_SHORT, self._last_regime, pnl)
+                else:
+                    logger.info(f"[INTRACANDLE] STOP LOSS SHORT: price={cur_price:.2f} >= stop={stop_price:.2f}")
+                    order = self.executor.place_market_order(
+                        self.symbol, 'buy', self.pos_short.size, 'SHORT', reduce_only=True)
+                    if order:
+                        actual = float(order.get('average', cur_price) or cur_price)
+                        fee = self.pos_short.size * actual * fee_rate
+                        pnl = self.pos_short.close_all(actual, fee)
+                        self.wallet_balance += pnl
+                        self.metrics['stops_short'] += 1
+                        self._partial_stop_fired_short = False
+                        self.grid_needs_regen = True
+                        self._log_trade_event(
+                            int(time.time() * 1000), actual, 0,
+                            LABEL_STOP_SHORT, self._last_regime, pnl)
+
+        if not self.pos_short.is_open:
+            self._partial_stop_fired_short = False
+
 
     def _compute_indicators(self):
         """Compute all indicators on the rolling buffer."""
@@ -686,16 +858,39 @@ class LiveRunner:
         resume_z = self.config.get('resume_z_threshold', -1.0)
         max_dd_pct = self.config.get('max_drawdown_pct', 0.15)
 
-        # ─── 1. REGIME (already computed) ────────────────────
+        # ─── 1. STATUS HEADER ─────────────────────────────────
+        regime_names = {0: 'NOISE', 1: 'UPTREND', -1: 'DOWNTREND',
+                        2: 'BREAKOUT_UP', -2: 'BREAKOUT_DOWN'}
+        regime_str = regime_names.get(prev_regime, str(prev_regime))
+        long_str = (f"L:{self.pos_long.size:.4f}@{self.pos_long.avg_entry:.2f}"
+                    if self.pos_long.is_open else "L:flat")
+        short_str = (f"S:{self.pos_short.size:.4f}@{self.pos_short.avg_entry:.2f}"
+                     if self.pos_short.is_open else "S:flat")
+        equity = self._total_equity(cur_close)
+        logger.info(
+            f"\n{'─'*60}\n"
+            f"  BAR | price={cur_close:.2f}  ATR={prev_atr:.2f}  Z={prev_z:.2f}  ER={prev_er:.2f}"
+            f"  regime={regime_str}"
+            f"  wallet=${self.wallet_balance:.2f}  equity=${equity:.2f}"
+            f"\n  pos  | {long_str}  {short_str}\n{'─'*60}"
+        )
 
-        # ─── 2. CIRCUIT BREAKER ──────────────────────────────
+        # ─── 2. CIRCUIT BREAKER ──────────────────────────────────
         if cb_enabled:
             if not self.halted and prev_z < halt_z:
+                logger.info(f"  [CB] Z={prev_z:.2f} breached halt threshold {halt_z}. Cancelling all orders.")
                 self.halted = True
                 self.metrics['circuit_breaker_triggers'] += 1
                 self.executor.cancel_all_orders(self.symbol)
                 self.active_orders.clear()
                 self.conditional_orders.clear()
+                if self.tg:
+                    self.tg.send(
+                        f'⚡ <b>CIRCUIT BREAKER HALT</b>\n'
+                        f'Symbol: <code>{self.symbol}</code>\n'
+                        f'Z-Score: <code>{prev_z:.2f}</code> (threshold {halt_z})\n'
+                        f'Price: <code>${cur_close:,.2f}</code>\n'
+                        f'All orders cancelled. Holding positions.')
                 self.trade_logger.log_event(
                     'CIRCUIT_BREAKER',
                     f'Z-Score: {prev_z:.2f} < {halt_z}. All orders cancelled.')
@@ -703,23 +898,32 @@ class LiveRunner:
                     cur_time, cur_close, 0, LABEL_CIRCUIT_BREAKER, prev_regime, 0)
 
             if self.halted and prev_z > resume_z:
+                logger.info(f"  [CB] Z={prev_z:.2f} recovered above {resume_z}. Resuming trading.")
                 self.halted = False
                 self.grid_needs_regen = True
+                if self.tg:
+                    self.tg.send(
+                        f'🟢 <b>CIRCUIT BREAKER RESUME</b>\n'
+                        f'Symbol: <code>{self.symbol}</code>\n'
+                        f'Z-Score recovered: <code>{prev_z:.2f}</code>\n'
+                        f'Trading resumed.')
                 self.trade_logger.log_event(
                     'CB_RESUME',
                     f'Z-Score: {prev_z:.2f} > {resume_z}. Trading resumed.')
 
         if self.halted:
+            logger.info(f"  [CB] HALTED — Z={prev_z:.2f}. Skipping grid/stops until recovery.")
             self._update_equity(cur_close)
             self._log_equity_bar(cur_time, cur_close, prev_regime)
             return
 
-        # ─── 3. STOP LOSS (ATR-based, partial) ────────────────
-        # Partial stop: multi-fill positions close 50% first, then full
-        # close at wider stop (1.5× mult). Single-fill = 100% close.
+        # ─── 3. STOP LOSS (ATR-based, partial) ──────────────────
         if self.pos_long.is_open:
             effective_mult = atr_sl_mult * 1.5 if self._partial_stop_fired_long else atr_sl_mult
             stop_price = self.pos_long.avg_entry - effective_mult * prev_atr
+            distance_pct = (cur_low - stop_price) / stop_price * 100
+            logger.info(f"  [SL]  LONG stop={stop_price:.2f}  low={cur_low:.2f}  "
+                        f"distance={distance_pct:+.2f}%{'  ← TRIGGERED' if cur_low <= stop_price else ''}")
             if cur_low <= stop_price:
                 if self.pos_long.num_fills > 1 and not self._partial_stop_fired_long:
                     # Stage 1: close 50%
@@ -767,6 +971,9 @@ class LiveRunner:
         if self.pos_short.is_open:
             effective_mult = atr_sl_mult * 1.5 if self._partial_stop_fired_short else atr_sl_mult
             stop_price = self.pos_short.avg_entry + effective_mult * prev_atr
+            distance_pct = (stop_price - cur_high) / stop_price * 100
+            logger.info(f"  [SL] SHORT stop={stop_price:.2f}  high={cur_high:.2f}  "
+                        f"distance={distance_pct:+.2f}%{'  ← TRIGGERED' if cur_high >= stop_price else ''}")
             if cur_high >= stop_price:
                 if self.pos_short.num_fills > 1 and not self._partial_stop_fired_short:
                     # Stage 1: close 50%
@@ -850,9 +1057,11 @@ class LiveRunner:
                     self._log_trade_event(
                         cur_time, cur_close, 0, LABEL_LIQUIDATION, prev_regime, pnl)
 
-        # ─── 5. PRUNING (5 methods, both sides) ─────────────
+        # ─── 5. PRUNING (5 methods, both sides) ─────────────────
         grid_spacing = calculate_dynamic_spacing(
             prev_atr, spacing_k, spacing_floor, cur_close)
+        logger.info(f"  [GRID] spacing={grid_spacing:.2f}  "
+                    f"levels={grid_levels}  regen_needed={self.grid_needs_regen}")
         grid_profit_potential = grid_spacing * order_pct * self.wallet_balance / max(cur_close, 1)
 
         # Use candle timestamp for pruning age checks (matches backtest behavior).
@@ -872,6 +1081,9 @@ class LiveRunner:
                 acc_profit, self.config)
             if prune_idx >= 0 and prune_idx < len(pos.fills):
                 fill = pos.fills[prune_idx]
+                logger.info(f"  [PRUNE] {side_key.upper()} {prune_label}: "
+                            f"fill@{fill['price']:.2f}  qty={fill['qty']:.4f}  "
+                            f"age={(prune_time - fill['timestamp'])/3.6e6:.1f}h")
                 fill_qty = fill['qty']
 
                 # Market close the specific fill
@@ -897,10 +1109,12 @@ class LiveRunner:
                 self._log_trade_event(
                     cur_time, cur_close, fill_qty, prune_label, prev_regime, pnl)
 
-        # ─── 6. TRAILING UP ──────────────────────────────────
+        # ─── 6. TRAILING UP ───────────────────────────────────────
         if trailing_enabled and prev_regime in (REGIME_UPTREND, REGIME_BREAKOUT_UP):
             if prev_er > trailing_er:
                 top_level = self.grid_anchor_long + grid_spacing * grid_levels
+                logger.info(f"  [TRAIL] Uptrend ER={prev_er:.2f} — price={cur_close:.2f}  "
+                            f"top_level={top_level:.2f}{'  → SHIFTING' if cur_close > top_level else ''}")
                 if cur_close > top_level:
                     shift = cur_close - self.grid_anchor_long
                     self.grid_anchor_long += shift * 0.5
@@ -911,16 +1125,19 @@ class LiveRunner:
                         'TRAILING_UP',
                         f'Anchor shifted to {self.grid_anchor_long:.2f}')
 
-        # ─── 7. VaR CONSTRAINT ───────────────────────────────
+        # ─── 7. VaR CONSTRAINT ────────────────────────────────────
         total_exposure = (self.pos_long.size + self.pos_short.size) * cur_close
         var_blocked = check_var_constraint(
             total_exposure, prev_vol, max_dd_pct,
             self._total_equity(cur_close))
         if var_blocked:
+            logger.info(f"  [VaR]  BLOCKED — exposure=${total_exposure:.2f}  vol={prev_vol:.4f}  "
+                        f"max_dd={max_dd_pct:.0%}")
             self.metrics['var_blocks'] += 1
 
-        # ─── 8. GENERATE GRID + PLACE ORDERS ─────────────────
+        # ─── 8. GENERATE GRID + PLACE ORDERS ─────────────────────
         if self.grid_needs_regen and not var_blocked:
+            logger.info(f"  [GRID] Regenerating — reason: regen_flag set, VaR clear")
             # Cancel existing orders and re-fetch to catch race condition fills
             cancel_result = self.executor.cancel_all_orders(self.symbol)
             if cancel_result < 0:
@@ -936,6 +1153,8 @@ class LiveRunner:
             # Fetch real funding rate
             funding_rate = self.executor.get_funding_rate(self.symbol)
             long_bias, short_bias = should_bias_for_funding(prev_regime, funding_rate)
+            logger.info(f"  [GRID] funding_rate={funding_rate*100:.4f}%  "
+                        f"long_bias={long_bias}  short_bias={short_bias}")
 
             # Read A-S time horizon from config (default 96 = 1 day of 15m bars)
             as_time_horizon = self.config.get('as_time_horizon', 96.0)
