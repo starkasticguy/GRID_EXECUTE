@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 from core.kama import (
     calculate_er, calculate_kama, detect_regime,
+    resample_ohlcv, apply_regime_hysteresis,
     REGIME_NOISE, REGIME_UPTREND, REGIME_DOWNTREND,
     REGIME_BREAKOUT_UP, REGIME_BREAKOUT_DOWN, REGIME_NAMES,
 )
@@ -27,6 +28,7 @@ from core.adx import calculate_adx
 from core.grid import (
     generate_grid_levels, generate_geometric_grid_levels,
     calculate_order_qty, calculate_dynamic_spacing,
+    calculate_adaptive_floor,
 )
 from core.inventory import get_skewed_grid_params, normalize_inventory
 from core.risk import check_var_constraint, calculate_liquidation_price
@@ -562,17 +564,23 @@ class LiveRunner:
             kama_p = self.config['kama_period']
             atr_p = self.config['atr_period']
 
-            er = calculate_er(closes, kama_p)
-            kama = calculate_kama(closes, er,
-                                   self.config['kama_fast'],
-                                   self.config['kama_slow'])
             atr = calculate_atr(highs, lows, closes, atr_p)
 
-            # ─── ADX veto: override TREND→NOISE when ADX < threshold ─
+            # ─── Multi-timeframe regime (HTF KAMA/ER on resampled data) ───
+            htf_mult = self.config.get('regime_timeframe_mult', 4)
+            htf_close, htf_high, htf_low = resample_ohlcv(
+                closes, highs, lows, mult=htf_mult)
+            htf_atr = calculate_atr(htf_high, htf_low, htf_close, atr_p)
+            er = calculate_er(htf_close, kama_p)
+            kama = calculate_kama(htf_close, er,
+                                   self.config['kama_fast'],
+                                   self.config['kama_slow'])
+
+            # ─── ADX veto: computed on 15m for sensitivity ─
             adx_period = self.config.get('adx_period', 14)
             adx_threshold = self.config.get('adx_trend_threshold', 25.0)
             adx = calculate_adx(highs, lows, closes, adx_period)
-            raw_regime = detect_regime(kama, er, atr,
+            raw_regime = detect_regime(kama, er, htf_atr,
                                        self.config['regime_threshold'],
                                        self.config['er_trend_threshold'])
             # Apply ADX veto: if trend/breakout regime but ADX is weak → NOISE
@@ -581,7 +589,9 @@ class LiveRunner:
                 if abs(veto_regime[idx]) in (1, 2) and adx[idx] < adx_threshold:
                     veto_regime[idx] = REGIME_NOISE
 
-            regime = veto_regime   # hysteresis is a backtest optimisation; live uses raw veto
+            # ─── Hysteresis debounce ───
+            hysteresis_bars = self.config.get('regime_hysteresis_bars', 3)
+            regime = apply_regime_hysteresis(veto_regime, min_bars=hysteresis_bars)
             z_score = calculate_z_score(closes, atr, 20)
             volatility = calculate_rolling_volatility(closes, atr_p)
 
@@ -946,55 +956,61 @@ class LiveRunner:
             logger.info(f"  [SL]  LONG stop={stop_price:.2f}  low={cur_low:.2f} close={cur_close:.2f} "
                         f"distance={distance_pct:+.2f}%{'  ← STAGE2' if stage2_trigger else ''}{' ← STAGE1' if stage1_trigger else ''}")
 
-            if stage2_trigger:
-                if self.pos_long.num_fills > 1 and not self._partial_stop_fired_long:
-                    # Stage 1: close 50% only on candle close breach
-                    if stage1_trigger:
-                        close_qty = self.pos_long.size * 0.5
-                        logger.info(f"PARTIAL STOP LONG (50%): close={cur_close:.2f} <= stop={stop_price:.2f}, "
-                                    f"closing {close_qty:.6f} of {self.pos_long.size:.6f}")
-                        order = self.executor.place_market_order(
-                            self.symbol, 'sell', close_qty,
-                            'LONG', reduce_only=True)
-                    if order is None:
-                        logger.warning(f"Partial stop loss market order failed for LONG")
-                    else:
-                        actual_price = float(order.get('average', stop_price) or stop_price)
-                        fee = close_qty * actual_price * fee_rate
-                        pnl = self.pos_long.close_fill(actual_price, close_qty, fee)
-                        self.wallet_balance += pnl
-                        self.metrics['stops_long'] += 1
-                        self._partial_stop_fired_long = True
-                        self.grid_needs_regen = True
-                        self._log_trade_event(
-                            cur_time, actual_price, close_qty, LABEL_STOP_LONG, prev_regime, pnl)
+            if stage1_trigger and self.pos_long.num_fills > 1 and not self._partial_stop_fired_long:
+                # Stage 1: partial stop — close 50% on candle CLOSE breach (anti-wick)
+                close_qty = self.pos_long.size * 0.5
+                logger.info(f"PARTIAL STOP LONG (50%): close={cur_close:.2f} <= stop={stop_price:.2f}, "
+                            f"closing {close_qty:.6f} of {self.pos_long.size:.6f}")
+                order = self.executor.place_market_order(
+                    self.symbol, 'sell', close_qty,
+                    'LONG', reduce_only=True)
+                if order is None:
+                    logger.warning(f"Partial stop loss market order failed for LONG")
                 else:
-                    # Stage 2 (or single fill): close everything
-                    logger.info(f"STOP LOSS LONG triggered: low={cur_low:.2f} <= stop={stop_price:.2f}")
-                    order = self.executor.place_market_order(
-                        self.symbol, 'sell', self.pos_long.size,
-                        'LONG', reduce_only=True)
-                    if order is None:
-                        logger.warning(f"Stop loss market order failed for LONG "
-                                       f"(size={self.pos_long.size}), skipping internal close")
-                    else:
-                        actual_price = float(order.get('average', stop_price) or stop_price)
-                        fee = self.pos_long.size * actual_price * fee_rate
-                        pnl = self.pos_long.close_all(actual_price, fee)
-                        self.wallet_balance += pnl
-                        self.metrics['stops_long'] += 1
-                        self._partial_stop_fired_long = False
-                        self.grid_needs_regen = True
-                        # ─── Stop-cooldown counter (#2) ───────────────────────
-                        self._consecutive_stops += 1
-                        cooldown_thresh = self.config.get('stop_cooldown_thresh', 2)
-                        cooldown_bars = self.config.get('stop_cooldown_bars', 8)
-                        if self._consecutive_stops >= cooldown_thresh:
-                            self._descale_until_bar = self.bar_count + cooldown_bars
-                            logger.info(f"  [SL]  Consecutive stops={self._consecutive_stops} ≥ "
-                                        f"{cooldown_thresh}: de-scaling for {cooldown_bars} bars")
-                        self._log_trade_event(
-                            cur_time, actual_price, 0, LABEL_STOP_LONG, prev_regime, pnl)
+                    actual_price = float(order.get('average', stop_price) or stop_price)
+                    fee = close_qty * actual_price * fee_rate
+                    pnl = self.pos_long.close_fill(actual_price, close_qty, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_long'] += 1
+                    self._partial_stop_fired_long = True
+                    self.grid_needs_regen = True
+                    # ─── Stop-cooldown counter (matches backtest) ─────────
+                    self._consecutive_stops += 1
+                    cooldown_thresh = self.config.get('stop_cooldown_thresh', 2)
+                    cooldown_bars = self.config.get('stop_cooldown_bars', 48)
+                    if self._consecutive_stops >= cooldown_thresh:
+                        self._descale_until_bar = self.bar_count + cooldown_bars
+                        logger.info(f"  [SL]  Consecutive stops={self._consecutive_stops} ≥ "
+                                    f"{cooldown_thresh}: de-scaling for {cooldown_bars} bars")
+                    self._log_trade_event(
+                        cur_time, actual_price, close_qty, LABEL_STOP_LONG, prev_regime, pnl)
+            elif stage2_trigger:
+                # Stage 2 (or single fill): close everything
+                logger.info(f"STOP LOSS LONG triggered: low={cur_low:.2f} <= stop={stop_price:.2f}")
+                order = self.executor.place_market_order(
+                    self.symbol, 'sell', self.pos_long.size,
+                    'LONG', reduce_only=True)
+                if order is None:
+                    logger.warning(f"Stop loss market order failed for LONG "
+                                   f"(size={self.pos_long.size}), skipping internal close")
+                else:
+                    actual_price = float(order.get('average', stop_price) or stop_price)
+                    fee = self.pos_long.size * actual_price * fee_rate
+                    pnl = self.pos_long.close_all(actual_price, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_long'] += 1
+                    self._partial_stop_fired_long = False
+                    self.grid_needs_regen = True
+                    # ─── Stop-cooldown counter (#2) ───────────────────────
+                    self._consecutive_stops += 1
+                    cooldown_thresh = self.config.get('stop_cooldown_thresh', 2)
+                    cooldown_bars = self.config.get('stop_cooldown_bars', 48)
+                    if self._consecutive_stops >= cooldown_thresh:
+                        self._descale_until_bar = self.bar_count + cooldown_bars
+                        logger.info(f"  [SL]  Consecutive stops={self._consecutive_stops} ≥ "
+                                    f"{cooldown_thresh}: de-scaling for {cooldown_bars} bars")
+                    self._log_trade_event(
+                        cur_time, actual_price, 0, LABEL_STOP_LONG, prev_regime, pnl)
 
         if not self.pos_long.is_open:
             self._partial_stop_fired_long = False
@@ -1010,55 +1026,61 @@ class LiveRunner:
             logger.info(f"  [SL] SHORT stop={stop_price:.2f}  high={cur_high:.2f} close={cur_close:.2f} "
                         f"distance={distance_pct:+.2f}%{'  ← STAGE2' if stage2_trigger else ''}{' ← STAGE1' if stage1_trigger else ''}")
 
-            if stage2_trigger:
-                if self.pos_short.num_fills > 1 and not self._partial_stop_fired_short:
-                    # Stage 1: close 50% only on candle close breach
-                    if stage1_trigger:
-                        close_qty = self.pos_short.size * 0.5
-                        logger.info(f"PARTIAL STOP SHORT (50%): close={cur_close:.2f} >= stop={stop_price:.2f}, "
-                                    f"closing {close_qty:.6f} of {self.pos_short.size:.6f}")
-                        order = self.executor.place_market_order(
-                            self.symbol, 'buy', close_qty,
-                            'SHORT', reduce_only=True)
-                    if order is None:
-                        logger.warning(f"Partial stop loss market order failed for SHORT")
-                    else:
-                        actual_price = float(order.get('average', stop_price) or stop_price)
-                        fee = close_qty * actual_price * fee_rate
-                        pnl = self.pos_short.close_fill(actual_price, close_qty, fee)
-                        self.wallet_balance += pnl
-                        self.metrics['stops_short'] += 1
-                        self._partial_stop_fired_short = True
-                        self.grid_needs_regen = True
-                        self._log_trade_event(
-                            cur_time, actual_price, close_qty, LABEL_STOP_SHORT, prev_regime, pnl)
+            if stage1_trigger and self.pos_short.num_fills > 1 and not self._partial_stop_fired_short:
+                # Stage 1: partial stop — close 50% on candle CLOSE breach (anti-wick)
+                close_qty = self.pos_short.size * 0.5
+                logger.info(f"PARTIAL STOP SHORT (50%): close={cur_close:.2f} >= stop={stop_price:.2f}, "
+                            f"closing {close_qty:.6f} of {self.pos_short.size:.6f}")
+                order = self.executor.place_market_order(
+                    self.symbol, 'buy', close_qty,
+                    'SHORT', reduce_only=True)
+                if order is None:
+                    logger.warning(f"Partial stop loss market order failed for SHORT")
                 else:
-                    # Stage 2 (or single fill): close everything
-                    logger.info(f"STOP LOSS SHORT triggered: high={cur_high:.2f} >= stop={stop_price:.2f}")
-                    order = self.executor.place_market_order(
-                        self.symbol, 'buy', self.pos_short.size,
-                        'SHORT', reduce_only=True)
-                    if order is None:
-                        logger.warning(f"Stop loss market order failed for SHORT "
-                                       f"(size={self.pos_short.size}), skipping internal close")
-                    else:
-                        actual_price = float(order.get('average', stop_price) or stop_price)
-                        fee = self.pos_short.size * actual_price * fee_rate
-                        pnl = self.pos_short.close_all(actual_price, fee)
-                        self.wallet_balance += pnl
-                        self.metrics['stops_short'] += 1
-                        self._partial_stop_fired_short = False
-                        self.grid_needs_regen = True
-                        # ─── Stop-cooldown counter (#2) ───────────────────────
-                        self._consecutive_stops += 1
-                        cooldown_thresh = self.config.get('stop_cooldown_thresh', 2)
-                        cooldown_bars = self.config.get('stop_cooldown_bars', 8)
-                        if self._consecutive_stops >= cooldown_thresh:
-                            self._descale_until_bar = self.bar_count + cooldown_bars
-                            logger.info(f"  [SL]  Consecutive stops={self._consecutive_stops} ≥ "
-                                        f"{cooldown_thresh}: de-scaling for {cooldown_bars} bars")
-                        self._log_trade_event(
-                            cur_time, actual_price, 0, LABEL_STOP_SHORT, prev_regime, pnl)
+                    actual_price = float(order.get('average', stop_price) or stop_price)
+                    fee = close_qty * actual_price * fee_rate
+                    pnl = self.pos_short.close_fill(actual_price, close_qty, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_short'] += 1
+                    self._partial_stop_fired_short = True
+                    self.grid_needs_regen = True
+                    # ─── Stop-cooldown counter (matches backtest) ─────────
+                    self._consecutive_stops += 1
+                    cooldown_thresh = self.config.get('stop_cooldown_thresh', 2)
+                    cooldown_bars = self.config.get('stop_cooldown_bars', 48)
+                    if self._consecutive_stops >= cooldown_thresh:
+                        self._descale_until_bar = self.bar_count + cooldown_bars
+                        logger.info(f"  [SL]  Consecutive stops={self._consecutive_stops} ≥ "
+                                    f"{cooldown_thresh}: de-scaling for {cooldown_bars} bars")
+                    self._log_trade_event(
+                        cur_time, actual_price, close_qty, LABEL_STOP_SHORT, prev_regime, pnl)
+            elif stage2_trigger:
+                # Stage 2 (or single fill): close everything
+                logger.info(f"STOP LOSS SHORT triggered: high={cur_high:.2f} >= stop={stop_price:.2f}")
+                order = self.executor.place_market_order(
+                    self.symbol, 'buy', self.pos_short.size,
+                    'SHORT', reduce_only=True)
+                if order is None:
+                    logger.warning(f"Stop loss market order failed for SHORT "
+                                   f"(size={self.pos_short.size}), skipping internal close")
+                else:
+                    actual_price = float(order.get('average', stop_price) or stop_price)
+                    fee = self.pos_short.size * actual_price * fee_rate
+                    pnl = self.pos_short.close_all(actual_price, fee)
+                    self.wallet_balance += pnl
+                    self.metrics['stops_short'] += 1
+                    self._partial_stop_fired_short = False
+                    self.grid_needs_regen = True
+                    # ─── Stop-cooldown counter (#2) ───────────────────────
+                    self._consecutive_stops += 1
+                    cooldown_thresh = self.config.get('stop_cooldown_thresh', 2)
+                    cooldown_bars = self.config.get('stop_cooldown_bars', 48)
+                    if self._consecutive_stops >= cooldown_thresh:
+                        self._descale_until_bar = self.bar_count + cooldown_bars
+                        logger.info(f"  [SL]  Consecutive stops={self._consecutive_stops} ≥ "
+                                    f"{cooldown_thresh}: de-scaling for {cooldown_bars} bars")
+                    self._log_trade_event(
+                        cur_time, actual_price, 0, LABEL_STOP_SHORT, prev_regime, pnl)
 
         if not self.pos_short.is_open:
             self._partial_stop_fired_short = False
@@ -1155,6 +1177,14 @@ class LiveRunner:
                 self.metrics['prune_count'] += 1
                 self.metrics['prune_types'][prune_label] = \
                     self.metrics['prune_types'].get(prune_label, 0) + 1
+
+                # Update profit buffer: consume on offset prune, decrement on any loss
+                acc_attr = f'accumulated_profit_{side_key}'
+                if prune_label == 'PRUNE_OFFSET':
+                    setattr(self, acc_attr, max(0.0, acc_profit + pnl))
+                elif pnl < 0:
+                    setattr(self, acc_attr, max(0.0, acc_profit + pnl))
+
                 self.grid_needs_regen = True
                 self._log_trade_event(
                     cur_time, cur_close, fill_qty, prune_label, prev_regime, pnl)
@@ -1278,7 +1308,7 @@ class LiveRunner:
                 cur_time, grid_levels, spacing_k, spacing_floor,
                 gamma, kappa, effective_order_pct, leverage, max_inv_per_side,
                 effective_max_pos_pct, allow_short, long_bias, short_bias,
-                as_time_horizon)
+                as_time_horizon, prev_er=prev_er)
 
             # ─── 8b. EXCHANGE-SIDE STOP LOSS (STOP_MARKET) ─────
             # Places STOP_MARKET orders on Binance so stops execute
@@ -1371,9 +1401,27 @@ class LiveRunner:
                                  gamma, kappa, order_pct, leverage,
                                  max_inv_per_side, max_position_pct, allow_short,
                                  long_bias, short_bias,
-                                 as_time_horizon=96.0):
+                                 as_time_horizon=96.0,
+                                 prev_er=0.5):
         """Generate and place grid orders on exchange."""
-        base_spacing = calculate_dynamic_spacing(atr, spacing_k, spacing_floor, price)
+        # Adaptive floor: scales with coin vol ratio (matches backtest)
+        vol_scale = self.config.get('adaptive_floor_scale', 1.5)
+        adaptive_floor = calculate_adaptive_floor(atr, price, spacing_floor, vol_scale)
+        adaptive_floor_pct = adaptive_floor / price if price > 1e-9 else spacing_floor
+        base_spacing = calculate_dynamic_spacing(atr, spacing_k, adaptive_floor_pct, price)
+
+        # ─── Asymmetric Grid Spacing based on Regime & ER (matches backtest) ──
+        long_spacing_mult = 1.0
+        short_spacing_mult = 1.0
+        if regime in (REGIME_UPTREND, REGIME_BREAKOUT_UP):
+            long_spacing_mult = max(0.5, 1.0 - (prev_er / 2.0))
+            short_spacing_mult = 1.0 + prev_er
+        elif regime in (REGIME_DOWNTREND, REGIME_BREAKOUT_DOWN):
+            long_spacing_mult = 1.0 + prev_er
+            short_spacing_mult = max(0.5, 1.0 - (prev_er / 2.0))
+
+        base_long_spacing = base_spacing * long_spacing_mult
+        base_short_spacing = base_spacing * short_spacing_mult
         self._last_grid_spacing = base_spacing
 
         # ─── LONG GRID ──────────────────────────────────────
@@ -1384,7 +1432,7 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp, sell_sp, anchor_long = get_skewed_grid_params(
             price, inv_q_long, gamma, vol, kappa,
-            base_spacing, base_spacing,
+            base_long_spacing, base_long_spacing,
             time_horizon=as_time_horizon)
 
         self.grid_anchor_long = anchor_long
@@ -1446,13 +1494,16 @@ class LiveRunner:
                     long_orders += 1
 
         # Place long TPs as TAKE_PROFIT_MARKET conditional orders
-        # Equal-split across grid levels (matches backtest strategy.py)
+        # Concentrated: tp_concentration % at nearest level, rest spread across remaining
         # If per-level qty is below exchange minimum, aggregate into a single TP.
         if self.pos_long.is_open:
             min_qty = self.executor._min_amount(self.symbol) or 0.01
-            tp_qty_per_level = self.pos_long.size / max(grid_levels, 1)
+            tp_concentration = self.config.get('tp_concentration', 0.6)
+            n_levels = max(grid_levels, 1)
 
-            if tp_qty_per_level < min_qty:
+            # Check if the smallest TP slice would be below exchange minimum
+            smallest_tp = self.pos_long.size * (1.0 - tp_concentration) / max(n_levels - 1, 1)
+            if smallest_tp < min_qty:
                 # Position too small to split — place single TP at first sell level
                 if self.pos_long.size >= min_qty and len(sell_levels) > 0:
                     order = self.executor.place_take_profit(
@@ -1470,13 +1521,18 @@ class LiveRunner:
                         long_orders += 1
             else:
                 for lvl_i, lvl_price in enumerate(sell_levels):
-                    if tp_qty_per_level < 1e-12:
+                    if lvl_i == 0:
+                        tp_qty = self.pos_long.size * tp_concentration
+                    else:
+                        remaining_levels = max(n_levels - 1, 1)
+                        tp_qty = self.pos_long.size * (1.0 - tp_concentration) / remaining_levels
+                    if tp_qty < 1e-12:
                         break
                     order = self.executor.place_take_profit(
-                        self.symbol, 'sell', tp_qty_per_level, lvl_price, 'LONG',
+                        self.symbol, 'sell', tp_qty, lvl_price, 'LONG',
                         client_order_id=f'grid_L_TP_{lvl_i}_{int(timestamp)}')
                     if order:
-                        actual_qty = float(order.get('amount', tp_qty_per_level))
+                        actual_qty = float(order.get('amount', tp_qty))
                         self.conditional_orders[str(order['id'])] = {
                             'side': 'sell', 'price': lvl_price, 'qty': actual_qty,
                             'direction': DIR_LONG, 'reduce_only': True,
@@ -1515,7 +1571,7 @@ class LiveRunner:
             max_inv_per_side * order_pct * self.wallet_balance / max(price, 1))
         buy_sp_s, sell_sp_s, anchor_short = get_skewed_grid_params(
             price, inv_q_short, gamma, vol, kappa,
-            base_spacing, base_spacing,
+            base_short_spacing, base_short_spacing,
             time_horizon=as_time_horizon)
 
         self.grid_anchor_short = anchor_short
@@ -1558,13 +1614,15 @@ class LiveRunner:
                     short_orders += 1
 
         # Short TPs as TAKE_PROFIT_MARKET conditional orders
-        # Equal-split across grid levels (matches backtest strategy.py)
+        # Concentrated: tp_concentration % at nearest level, rest spread across remaining
         # If per-level qty is below exchange minimum, aggregate into a single TP.
         if self.pos_short.is_open:
             min_qty = self.executor._min_amount(self.symbol) or 0.01
-            tp_qty_per_level = self.pos_short.size / max(grid_levels, 1)
+            tp_concentration = self.config.get('tp_concentration', 0.6)
+            n_levels = max(grid_levels, 1)
 
-            if tp_qty_per_level < min_qty:
+            smallest_tp = self.pos_short.size * (1.0 - tp_concentration) / max(n_levels - 1, 1)
+            if smallest_tp < min_qty:
                 # Position too small to split — place single TP at first buy level
                 if self.pos_short.size >= min_qty and len(buy_levels_s) > 0:
                     order = self.executor.place_take_profit(
@@ -1582,13 +1640,18 @@ class LiveRunner:
                         short_orders += 1
             else:
                 for lvl_i, lvl_price in enumerate(buy_levels_s):
-                    if tp_qty_per_level < 1e-12 or lvl_price <= 0:
+                    if lvl_i == 0:
+                        tp_qty = self.pos_short.size * tp_concentration
+                    else:
+                        remaining_levels = max(n_levels - 1, 1)
+                        tp_qty = self.pos_short.size * (1.0 - tp_concentration) / remaining_levels
+                    if tp_qty < 1e-12 or lvl_price <= 0:
                         break
                     order = self.executor.place_take_profit(
-                        self.symbol, 'buy', tp_qty_per_level, lvl_price, 'SHORT',
+                        self.symbol, 'buy', tp_qty, lvl_price, 'SHORT',
                         client_order_id=f'grid_S_TP_{lvl_i}_{int(timestamp)}')
                     if order:
-                        actual_qty = float(order.get('amount', tp_qty_per_level))
+                        actual_qty = float(order.get('amount', tp_qty))
                         self.conditional_orders[str(order['id'])] = {
                             'side': 'buy', 'price': lvl_price, 'qty': actual_qty,
                             'direction': DIR_SHORT, 'reduce_only': True,
