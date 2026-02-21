@@ -37,7 +37,7 @@
         1.8506
     ],
     "n_trials": 200,
-    "n_windows": 5,
+    "n_windows": 6,
     "coins": [
         "ETH/USDT"
     ]

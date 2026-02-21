@@ -16,7 +16,7 @@ REPO_DIR="~/GRID_EXECUTE"
 SERVICE="gridbot"
 BRANCH="main"
 COIN="ETH"                    # coin the service is trading
-LEVERAGE="3"                  # must match config.py
+LEVERAGE="4"                  # must match config.py
 CAPITAL=""                    # leave empty = use full wallet balance
 
 # ─── Flags ───────────────────────────────────────────────────────
