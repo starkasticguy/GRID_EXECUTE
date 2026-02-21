@@ -51,12 +51,15 @@ def check_deviance_prune(position: PositionTracker, current_price: float,
 
 
 def check_oldest_prune(position: PositionTracker, current_time: float,
-                       max_age_seconds: float = 86400.0) -> int:
+                       max_age_seconds: float = 86400.0,
+                       current_price: float = None) -> int:
     """
     Method 1: Oldest Trade Pruning.
 
     Close positions held longer than max_age (default 24h).
     Prevents capital being locked in stale fills that aren't moving.
+
+    Skips fills that are currently in profit — let them reach their TP naturally.
 
     Returns fill index to prune (-1 if none).
     """
@@ -69,6 +72,14 @@ def check_oldest_prune(position: PositionTracker, current_time: float,
     for i, fill in enumerate(position.fills):
         age = current_time - fill['timestamp']
         if age > max_age_seconds and age > oldest_age:
+            # Skip profitable fills — let them reach TP naturally
+            if current_price is not None:
+                if position.side == 1:
+                    fill_pnl = (current_price - fill['price']) * fill['qty']
+                else:
+                    fill_pnl = (fill['price'] - current_price) * fill['qty']
+                if fill_pnl > 0:
+                    continue
             oldest_age = age
             oldest_idx = i
 
@@ -85,6 +96,8 @@ def check_gap_prune(position: PositionTracker, current_price: float,
     exceeds gap_mult * grid_spacing, the grid is effectively broken.
     Close the most distant fill.
 
+    Skips fills that are currently in profit — let them reach their TP naturally.
+
     Returns fill index to prune (-1 if none).
     """
     if not position.fills:
@@ -99,6 +112,13 @@ def check_gap_prune(position: PositionTracker, current_price: float,
     for i, fill in enumerate(position.fills):
         gap = abs(current_price - fill['price'])
         if gap > gap_threshold and gap > worst_gap:
+            # Skip profitable fills — gap prune is for broken grid, not harvest
+            if position.side == 1:
+                fill_pnl = (current_price - fill['price']) * fill['qty']
+            else:
+                fill_pnl = (fill['price'] - current_price) * fill['qty']
+            if fill_pnl > 0:
+                continue
             worst_gap = gap
             worst_idx = i
 
@@ -137,14 +157,17 @@ def check_funding_prune(position: PositionTracker,
 def check_profit_offset_prune(position: PositionTracker,
                               current_price: float,
                               accumulated_profit: float,
-                              min_profit_buffer: float = 0.0) -> int:
+                              min_profit_buffer: float = 0.0,
+                              offset_ratio: float = 1.5) -> int:
     """
     Method 4: Profit Offset Pruning.
 
     Use accumulated realized profit as a buffer to close the worst
     losing fill at reduced net cost.
 
-    Only triggers if accumulated_profit > min_profit_buffer.
+    Only triggers if accumulated_profit > worst_loss * offset_ratio.
+    Higher offset_ratio = less aggressive (default 1.5 means profit must
+    cover 150% of the loss before subsidizing a close).
 
     Returns fill index to prune (-1 if none).
     """
@@ -169,11 +192,12 @@ def check_profit_offset_prune(position: PositionTracker,
             worst_loss = loss
             worst_idx = i
 
-    # Only prune if the loss can be offset by profit buffer
-    if worst_idx >= 0 and worst_loss > 0 and accumulated_profit > worst_loss * 0.5:
+    # Only prune if profit buffer covers offset_ratio × loss
+    if worst_idx >= 0 and worst_loss > 0 and accumulated_profit > worst_loss * offset_ratio:
         return worst_idx
 
     return -1
+
 
 
 def run_pruning_cycle(position: PositionTracker, current_price: float,
@@ -181,9 +205,15 @@ def run_pruning_cycle(position: PositionTracker, current_price: float,
                       grid_anchor: float, grid_spacing: float,
                       grid_profit_potential: float,
                       accumulated_profit: float,
-                      config: dict) -> tuple:
+                      config: dict,
+                      is_on_cooldown: bool = False) -> tuple:
     """
     Run all 5 pruning methods in priority order.
+
+    Args:
+        is_on_cooldown: If True, only PRUNE_DEVIANCE (toxic) fires.
+                        All other prune types are suppressed to prevent
+                        cascading prunes in volatile markets.
 
     Returns:
         (fill_index, prune_label) or (-1, None) if no prune needed.
@@ -195,14 +225,19 @@ def run_pruning_cycle(position: PositionTracker, current_price: float,
     max_age = config.get('max_position_age_hours', 24) * 3600.0 * 1000.0  # ms (timestamps are in ms)
     gap_mult = config.get('gap_prune_mult', 3.0)
     funding_ratio = config.get('funding_cost_ratio', 0.5)
+    offset_ratio = config.get('offset_prune_ratio', 1.5)
 
-    # 1. Deviance (most urgent — toxic position)
+    # 1. Deviance (most urgent — toxic position) — ALWAYS fires, ignores cooldown
     idx = check_deviance_prune(position, current_price, kama_price, atr, sigma_mult)
     if idx >= 0:
         return idx, LABEL_PRUNE_DEVIANCE
 
-    # 2. Oldest (stale capital)
-    idx = check_oldest_prune(position, current_time, max_age)
+    # All other prune types are suppressed during cooldown
+    if is_on_cooldown:
+        return -1, None
+
+    # 2. Oldest (stale capital) — skip profitable fills
+    idx = check_oldest_prune(position, current_time, max_age, current_price)
     if idx >= 0:
         return idx, LABEL_PRUNE_OLDEST
 
@@ -217,8 +252,10 @@ def run_pruning_cycle(position: PositionTracker, current_price: float,
         return idx, LABEL_PRUNE_FUNDING
 
     # 5. Profit offset (subsidized close)
-    idx = check_profit_offset_prune(position, current_price, accumulated_profit)
+    idx = check_profit_offset_prune(position, current_price, accumulated_profit,
+                                    offset_ratio=offset_ratio)
     if idx >= 0:
         return idx, LABEL_PRUNE_OFFSET
 
     return -1, None
+

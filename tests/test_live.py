@@ -1228,14 +1228,15 @@ class TestMinimumOrderQty:
     def test_tp_aggregation_when_below_min(self, tmp_dir):
         """When per-level TP qty < min, single aggregated TP is placed."""
         runner = self._make_runner(tmp_dir)
-        # Small long position: 0.02 SOL, grid_levels=4 → 0.005 per level
-        runner.pos_long.add_fill(85.0, 0.02, time.time() * 1000, 0)
+        # Use a position small enough that qty/levels is always < 0.01,
+        # regardless of grid_levels config (works for levels=2+ since 0.019/2 < 0.01)
+        runner.pos_long.add_fill(85.0, 0.019, time.time() * 1000, 0)
         runner.executor._min_amount = lambda sym: 0.01
 
         grid_levels = runner.config['grid_levels']
         tp_qty_per_level = runner.pos_long.size / max(grid_levels, 1)
 
-        # Per-level qty should be below min
+        # Per-level qty should be below min (0.019/2 = 0.0095 < 0.01)
         assert tp_qty_per_level < 0.01
         # But full position is above min
         assert runner.pos_long.size >= 0.01

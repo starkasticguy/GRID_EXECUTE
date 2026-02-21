@@ -96,12 +96,15 @@ class OrderBook:
         self.orders = remaining
         return filled
 
-    def cancel_all(self, direction: int = None, side: int = None):
+    def cancel_all(self, direction: int = None, side: int = None,
+                   reduce_only: bool = None):
         """
-        Cancel all orders, optionally filtered by direction and/or side.
+        Cancel all orders, optionally filtered by direction, side, and/or reduce_only.
 
-        direction: 1=Long grid only, -1=Short grid only, None=all
-        side: 1=Buys only, -1=Sells only, None=all
+        direction:   1=Long grid only, -1=Short grid only, None=all
+        side:        1=Buys only, -1=Sells only, None=all
+        reduce_only: True=only cancel TPs, False=only cancel entries, None=all
+                     Pass reduce_only=False on grid regen to preserve live TPs.
         """
         remaining = []
         for order in self.orders:
@@ -109,6 +112,8 @@ class OrderBook:
             if direction is not None and order['direction'] != direction:
                 cancel = False
             if side is not None and order['side'] != side:
+                cancel = False
+            if reduce_only is not None and order.get('reduce_only', False) != reduce_only:
                 cancel = False
             if cancel:
                 order['status'] = STATUS_CANCELLED

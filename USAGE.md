@@ -1,6 +1,6 @@
 # GridStrategyV4 — Complete Usage Guide
 
-Every way to run, configure, optimize, and extend the V4 grid trading engine.
+Every way to run, configure, optimize, and extend the V4.2 grid trading engine.
 
 ---
 
@@ -363,16 +363,31 @@ Defined in `OPTIMIZER_SPACE` in `config.py`:
 
 | Parameter | Type | Range | Category |
 |-----------|------|-------|----------|
-| `grid_spacing_k` | float | 0.3 – 2.0 | Grid Structure |
-| `grid_levels` | int | 2 – 8 | Grid Structure |
+| `grid_spacing_k` | float | 0.8 – 2.5 | Grid Structure |
+| `spacing_floor` | float | 0.004 – 0.010 | Grid Structure |
+| `grid_levels` | int | 2 – 6 | Grid Structure |
+| `regen_drift_mult` | float | 1.0 – 4.0 | Grid Structure |
+| `adaptive_floor_scale` | float | 0.5 – 3.0 | Grid Structure |
+| `tp_concentration` | float | 0.4 – 0.9 | Grid Structure |
 | `gamma` | float | 0.3 – 2.0 | Inventory Control |
 | `kappa` | float | 0.5 – 3.0 | Inventory Control |
-| `as_time_horizon` | float | 32 – 288 | Inventory Control |
 | `max_inventory_per_side` | int | 2 – 6 | Inventory Control |
+| `as_time_horizon` | float | 32 – 288 | Inventory Control |
+| `regime_hysteresis_bars` | int | 1 – 6 | Regime Detection |
+| `adx_trend_threshold` | float | 20.0 – 35.0 | Regime Detection (**new V4.2**) |
 | `atr_sl_mult` | float | 2.0 – 5.0 | Risk Management |
 | `max_position_pct` | float | 0.3 – 0.7 | Risk Management |
-| `trailing_enabled` | categorical | True, False | Mode Switches |
-| `allow_short` | categorical | True, False | Mode Switches |
+| `stop_cooldown_bars` | int | 24 – 96 | Risk Management (**new V4.2**) |
+| `low_volume_threshold` | float | 0.30 – 0.70 | Risk Management (**new V4.2**) |
+| `deviance_sigma` | float | 2.5 – 6.0 | Pruning |
+| `gap_prune_mult` | float | 2.5 – 7.0 | Pruning |
+| `offset_prune_ratio` | float | 0.8 – 4.0 | Pruning |
+| `prune_cooldown_bars` | int | 1 – 8 | Pruning |
+| `kelly_window` | int | 30 – 100 | Sizing (**new V4.2**) |
+| `funding_harvest_threshold` | float | 0.0001 – 0.0005 | Funding (**new V4.2**) |
+
+**Hardcoded (not optimized)** — these are domain/exchange constants, not strategy levers:
+- `adx_period = 14` (Wilder's canonical), `kelly_fraction = 0.25` (Quarter-Kelly theory), `round_number_nudge` (market microstructure), `fee_maker/fee_taker` (exchange fees), `VaR_deleverage_ratio = 0.75` (risk boundary), `high_corr_threshold = 0.80` (empirical crisis correlation)
 
 Commented-out parameters in `OPTIMIZER_SPACE` are fixed at their `STRATEGY_PARAMS` values. Uncomment to include them in search.
 
@@ -731,6 +746,63 @@ python3 tests/test_pruning.py
 ## Configuration Reference
 
 All parameters live in `config.py` in three dictionaries:
+
+### Advanced Pipeline Features (V4.2)
+
+#### 1. Machine Learning State Classification (GMM)
+By default, the strategy discovers market regimes using a Kaufman Adaptive Moving Average (KAMA) FSM. You can switch to **Unsupervised Machine Learning**:
+```python
+# In config.py -> STRATEGY_PARAMS
+'use_ml_regime': True 
+```
+When enabled, a Gaussian Mixture Model clusters rolling returns and normalized volatility into Bull, Bear, and Noise states dynamically.
+
+#### 2. ADX Veto Filter (new in V4.2)
+All trend signals (UPTREND / DOWNTREND) from both KAMA and GMM are vetoed back to NOISE when `ADX < adx_trend_threshold` (default 25). This prevents the strategy from taking one-sided positions during whale fakeouts — a critical crypto-specific failure mode.
+```python
+'adx_period': 14
+'adx_trend_threshold': 25.0  # raise to 30 for more conservative trend detection
+```
+
+#### 3. Geometric Grid with Round-Number Avoidance (new in V4.2)
+Grids default to percentage-based spacing that widens exponentially outward instead of linear arithmetic spacing. Additionally, levels landing near round-number stop-hunt magnets (e.g., $60,000) are nudged 0.15% away.
+```python
+'grid_mode': 'geometric'  # default; set to 'arithmetic' for legacy behavior
+```
+
+#### 4. Quarter-Kelly Dynamic Sizing (new in V4.2)
+Order size is dynamically scaled by a Quarter-Kelly fraction computed from the last 50 regime-filtered trades. This adapts exposure to current strategy edge rather than using a fixed `order_pct`.
+```python
+'kelly_window': 50    # rolling trade window
+'order_pct': 0.05     # base size; Kelly multiplier scales this down
+```
+
+#### 5. Stop-Loss Cooldown + Candle-Close Stage 1 (new in V4.2)
+- **Candle-Close Stops**: Stage 1 partial stop-loss only fires when the *closing price* crosses the stop level. This prevents flash crash wicks from triggering premature exits that recover within the same bar.
+- **Cooldown De-scaling**: After 2 consecutive stops within 48 bars (12h), `order_pct` is halved for the next 48 bars to prevent re-entering at full size during liquidation cascades.
+```python
+'stop_cooldown_bars': 48
+'stop_cooldown_thresh': 2
+```
+
+#### 6. VaR Pre-emptive De-Leverage (new in V4.2)
+At 75% of the `max_drawdown_pct` limit, the strategy force-closes the single worst fill on each side (tagged `PRUNE_VAR_WARNING`) before the hard cap is triggered. Gradual de-leveraging is less disruptive than a sudden full halt.
+
+#### 7. Weekend / Low-Liquidity De-Scaling (new in V4.2)
+When current bar volume is below 50% of the rolling 7-day average, `max_position_pct` is automatically reduced by 30%. No external calendar needed — uses existing OHLCV volume data.
+```python
+'low_volume_threshold': 0.5  # 50% of 7-day rolling average
+```
+
+#### 8. Funding Harvesting Sizing (new in V4.2)
+In NOISE regime, when `|funding_rate| > 0.02%`, order size on the receiving side is increased 25% and reduced 25% on the paying side. This harvests the perp funding premium without directional betting.
+```python
+'funding_harvest_threshold': 0.0002  # 0.02%
+```
+
+#### 9. Asymmetric Grids & Real Funding Rates
+- **Asymmetric Grids**: Spacing adapts based on Efficiency Ratio (trend strength).
+- **Historical Funding**: Real 8h funding rates from Binance are interpolated into 15m Parquet files for precise holding cost simulation.
 
 ### STRATEGY_PARAMS
 

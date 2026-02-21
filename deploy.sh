@@ -90,8 +90,34 @@ cp -r data/live_state/*.json "\$SNAP_DIR/" 2>/dev/null && \\
   echo "[server] State backed up to \$SNAP_DIR" || \\
   echo "[server] No state files to back up."
 
-echo "[server] Updating systemd service file..."
-cp deploy/gridbot.service /etc/systemd/system/gridbot.service
+echo "[server] Generating systemd service file dynamically..."
+cat << EOF_SVC > /etc/systemd/system/gridbot.service
+[Unit]
+Description=GRID Trading Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/GRID_EXECUTE
+EnvironmentFile=/root/GRID_EXECUTE/.env
+ExecStart=/root/GRID_EXECUTE/venv/bin/python3 live_trade.py --coin ${COIN} --leverage ${LEVERAGE} --resume ${CAPITAL_ARG}
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gridbot
+
+[Install]
+WantedBy=multi-user.target
+EOF_SVC
+
+
 systemctl daemon-reload
 
 echo "[server] Starting service..."

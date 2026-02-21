@@ -1,18 +1,21 @@
 """
-GridStrategyV4 Optimizer — Walk-Forward with Anchored OOS.
+GridStrategyV4 Optimizer — Rolling Walk-Forward with Trimmed-Mean Aggregation.
 
-Anti-overfit design (industry standard):
-  1. Anchored Walk-Forward: Non-overlapping train/test windows, full data coverage
-  2. Train-only fitness: TPE optimizes on TRAIN Calmar; test is held out
-  3. OOS gate: Best params must also pass on held-out test windows
-  4. Multi-coin averaging: Parameters must work across all coins
-  5. Composite fitness: Calmar × ProfitFactor with min-trade & complexity gates
-  6. Pessimistic aggregation: min() across windows (not mean)
-  7. Monte Carlo validation: Permutation test for statistical significance
-  8. Full parameter coverage: Includes inventory, risk, and pruning params
+Anti-overfit design (V4.2 — improved):
+  1. Rolling Walk-Forward: Fixed-length train windows slide by 1 step each fold.
+     Equal train-set size per fold prevents early history from dominating.
+  2. Train-only fitness: TPE optimizes on TRAIN Sortino; test is held out.
+  3. OOS gate: Best params must also pass on held-out test windows.
+  4. Multi-coin robustness: Parameters must generalize across all coins.
+  5. Composite fitness: Sortino × sqrt(PF) with hard gates (min-trades, DD cap,
+     blow-up guard) and quadratic overtrade penalty.
+  6. Trimmed-mean aggregation: Drop worst 1 window before averaging.
+     Prevents a single flash-crash window from killing robust param sets.
+  7. Cross-coin CV stability penalty baked into objective score.
+  8. Monte Carlo validation: Permutation test for statistical significance.
 
 Usage:
-  python3 optimizer.py --coins BTC ETH SOL --trials 200 --windows 4
+  python3 optimizer.py --coins BTC ETH SOL --trials 300 --windows 6
 """
 import optuna
 from optuna.trial import TrialState
@@ -44,53 +47,56 @@ def load_data(coins, start, end, timeframe='15m'):
     return data
 
 
-# ─── Walk-Forward Splitting (Anchored, Non-Overlapping) ──────
+# ─── Walk-Forward Splitting (Rolling Fixed-Window) ───────────
 
-def split_anchored_walk_forward(df, n_windows=4, train_ratio=0.7):
+def split_rolling_walk_forward(df, n_windows=4, train_ratio=0.7):
     """
-    Anchored walk-forward: non-overlapping windows covering 100% of data.
+    Rolling walk-forward: fixed-length train + test windows that slide forward.
 
     Layout for n_windows=4 on data of length N:
-      Window size = N / n_windows
-      W0: [0 .. 0.7*ws] train | [0.7*ws .. ws] test
-      W1: [0 .. ws + 0.7*ws] train | [ws + 0.7*ws .. 2*ws] test
-      W2: [0 .. 2*ws + 0.7*ws] train | [2*ws + 0.7*ws .. 3*ws] test
-      W3: [0 .. 3*ws + 0.7*ws] train | [3*ws + 0.7*ws .. 4*ws] test
+      Each fold covers chunk = N / n_windows bars.
+      Train = first train_ratio of chunk; Test = remainder of chunk.
+      Each fold starts at the end of the previous fold's chunk (rolling).
 
-    Properties:
-      - Train always starts from bar 0 (anchored / expanding window)
-      - Test windows are strictly non-overlapping
-      - No test data ever appears in any train set (zero leakage)
-      - Covers 100% of data
-      - Train grows with each window (simulates real deployment)
+    Example for n_windows=4, train_ratio=0.7, N=16000:
+      chunk = 4000 bars
+      W0: train=[0..2800]      test=[2800..4000]
+      W1: train=[4000..6800]   test=[6800..8000]
+      W2: train=[8000..10800]  test=[10800..12000]
+      W3: train=[12000..14800] test=[14800..16000]
+
+    Key property vs anchored walk-forward:
+      - Every fold has EQUAL-LENGTH train data (no early-data dominance bias)
+      - Each fold tests on a completely fresh, unseen time window
+      - Regime shifts are tested independently rather than diluted by history
 
     Returns list of (train_df, test_df) tuples.
     """
     n = len(df)
-    window_size = n // n_windows
+    chunk = n // n_windows
+    train_len = int(chunk * train_ratio)
     splits = []
 
     for w in range(n_windows):
-        # Train: from start to train_ratio into this window's chunk
-        train_end = w * window_size + int(window_size * train_ratio)
-        # Test: from train_end to end of this window's chunk
-        test_start = train_end
-        test_end = (w + 1) * window_size
-        if w == n_windows - 1:
-            test_end = n  # Last window gets remaining bars
+        fold_start = w * chunk
+        train_end  = fold_start + train_len
+        test_end   = (w + 1) * chunk if w < n_windows - 1 else n
 
-        train_end = min(train_end, n)
-        test_start = min(test_start, n)
-        test_end = min(test_end, n)
+        if train_end >= n or test_end > n:
+            break
 
-        train_df = df.iloc[0:train_end].reset_index(drop=True)
-        test_df = df.iloc[test_start:test_end].reset_index(drop=True)
+        train_df = df.iloc[fold_start:train_end].reset_index(drop=True)
+        test_df  = df.iloc[train_end:test_end].reset_index(drop=True)
 
-        # Minimum viable sizes
         if len(train_df) >= 200 and len(test_df) >= 50:
             splits.append((train_df, test_df))
 
     return splits
+
+
+# Keep alias so tests that import the old name still work
+split_anchored_walk_forward = split_rolling_walk_forward
+
 
 
 # ─── Strategy Runner ─────────────────────────────────────────
@@ -112,57 +118,114 @@ def run_strategy(df, params):
 
 def composite_fitness(metrics):
     """
-    Composite fitness: Calmar × sqrt(ProfitFactor).
+    Composite fitness: H(Sortino, Calmar) × √PF × consistency_factor
 
-    Gates:
-      - min_trades: Must generate ≥ 20 trades (else not meaningful)
-      - profit_factor: Must be > 1.0 (else strategy loses money)
-      - max_drawdown: Must be < 50% (else too risky)
-      - final_capital: Must be > starting capital * 0.5
+    Three failure modes this score covers:
 
-    The sqrt(PF) weighting ensures profit_factor matters but doesn't
-    dominate — a PF of 2.0 gives 1.41x boost, PF of 4.0 gives 2.0x.
+      1. CHRONIC BLEED (many small losses accumulating via fees/funding)
+         → Sortino penalizes sustained downside vol regardless of single events.
+
+      2. BLACK SWAN WIPE (one directional move wipes the grid)
+         → Calmar penalizes max peak-to-trough drawdown directly.
+
+      3. LUCKY-STREAK FRAGILITY (params work in one regime cluster only)
+         → consistency_factor penalizes low win rates, which correlates with
+           strategies that rely on rare large wins that won't persist when
+           the regime shifts.
+
+    Why HARMONIC mean (not geometric, not arithmetic):
+      H(S, C) = 2SC / (S + C)
+      Harmonic is stricter than geometric when the two values are unequal:
+        Sortino=3.0, Calmar=0.1:
+          Geometric  → √(0.30) = 0.55
+          Harmonic   → 2×0.3/3.1 = 0.19   (3× harsher on the weak dimension)
+      The weakest component dominates — correct for a leveraged grid bot
+      where a single flash crash IS the limiting risk, not average behavior.
+
+    Hard gates (return -10.0 immediately):
+      - total_trades < 20  : too few events for statistical validity
+      - max_drawdown > 50% : blow-up territory
+      - final_capital < 50% of start : catastrophic loss
+      - profit_factor < 0.5 : consistently losing money
+
+    Soft penalty (both Sortino and Calmar must be positive):
+      If either is <= 0, a gradient-preserving soft penalty is returned
+      so TPE can still learn the direction, not just hit -10.0 cliff.
     """
     total_trades = metrics.get('total_trades', 0)
-    ret = metrics.get('total_return_pct', 0)
-    dd = metrics.get('max_drawdown_pct', 0.01)
-    pf = metrics.get('profit_factor', 0)
-    final_cap = metrics.get('final_capital', 0)
-    initial_cap = STRATEGY_PARAMS.get('initial_capital', 10000)
+    ret          = metrics.get('total_return_pct', 0)
+    dd           = metrics.get('max_drawdown_pct', 0.01)
+    pf           = metrics.get('profit_factor', 0)
+    sortino      = metrics.get('sortino_ratio', 0)
+    win_rate     = metrics.get('win_rate_pct', 50.0)
+    final_cap    = metrics.get('final_capital', 0)
+    initial_cap  = STRATEGY_PARAMS.get('initial_capital', 10000)
 
-    # ─── Hard gates ───
+    # ─── Hard gates ───────────────────────────────────────────
     if total_trades < 20:
-        return -10.0  # Not enough trades for statistical meaning
-
-    if dd < 0.01:
-        dd = 0.01  # Floor to avoid divide-by-zero
+        return -10.0   # Insufficient statistical sample
 
     if dd > 50.0:
-        return -10.0  # Excessive drawdown
+        return -10.0   # Black swan already triggered
 
     if final_cap < initial_cap * 0.5:
-        return -10.0  # Lost more than 50% — blow-up
+        return -10.0   # Account blow-up (> 50% capital loss)
 
     if pf < 0.5:
-        return -10.0  # Terrible win/loss ratio
+        return -10.0   # Consistent money-loser
 
-    # ─── Calmar Ratio ───
-    calmar = ret / dd
+    if dd < 0.01:
+        dd = 0.01      # Floor to avoid Calmar divide-by-zero
 
-    # ─── Profit Factor bonus ───
-    # sqrt(PF) caps the bonus: PF=1.5 → 1.22x, PF=2.0 → 1.41x, PF=3.0 → 1.73x
+    # Use engine-computed calmar (from full equity curve) if available;
+    # fall back to ret/dd if key is somehow missing
+    calmar = metrics.get('calmar_ratio', ret / dd)
+
+    # ─── Soft penalty: both ratios must be positive ────────────
+    # If either is <= 0, return a gradient-preserving penalty
+    # so TPE learns direction rather than hitting a hard cliff.
+    if calmar <= 0 or sortino <= 0:
+        soft = (min(calmar, 0.0) + min(sortino, 0.0)) * 0.5
+        return float(np.clip(soft, -9.9, -0.01))
+
+    # ─── Harmonic mean H(Sortino, Calmar) ─────────────────────
+    # H = 2SC / (S + C).  Punishes the weaker ratio harder than
+    # geometric mean — the system's floor, not its ceiling, matters.
+    harmonic = (2.0 * sortino * calmar) / (sortino + calmar)
+
+    # ─── √PF reward ───────────────────────────────────────────
+    # Caps the bonus: PF=1.5→×1.22, PF=2.0→×1.41, PF=4.0→×2.0.
     pf_bonus = np.sqrt(max(pf, 0.1))
 
-    # ─── Complexity penalty ───
-    # Penalize > 200 trades per 10,000 bars (overtrade signal)
-    # Scale by data length to be fair across window sizes
+    # ─── Consistency factor ────────────────────────────────────
+    # Maps win_rate [0..100] → [0.5..1.5]:
+    #   30% win rate → 0.80 (penalty)
+    #   50% win rate → 1.00 (neutral)
+    #   65% win rate → 1.15 (moderate bonus)
+    #   75%+ win rate → 1.25 capped (diminishing returns)
+    # Penalizes strategies that rely on rare large wins — these are
+    # regime-specific and won't generalise when the regime shifts.
+    wr_norm     = win_rate / 100.0                       # [0..1]
+    consistency = float(np.clip(0.5 + wr_norm, 0.5, 1.5))
+
+    primary = harmonic * pf_bonus * consistency
+
+    # ─── Quadratic overtrade penalty ──────────────────────────
+    # Neutral below 500 trades; then grows quadratically.
+    # 700 trades → 0.09, 1000 trades → 0.32, capped at 2.0.
     penalty = 0.0
-    if total_trades > 300:
-        penalty = 0.01 * (total_trades - 300)
+    if total_trades > 500:
+        excess  = total_trades - 500
+        penalty = 0.0001 * (excess ** 1.5)
+        penalty = min(penalty, 2.0)
 
-    score = calmar * pf_bonus - penalty
+    return float(primary - penalty)
 
-    return score
+
+# What this score optimises toward (for reporting)
+FITNESS_PRIMARY_METRIC = 'harmonic(sortino, calmar) × √PF × consistency'
+
+
 
 
 # ─── Objective Function ──────────────────────────────────────
@@ -171,48 +234,46 @@ def objective(trial):
     """
     Optuna objective: Maximize TRAIN-set composite fitness.
 
-    Key anti-overfit property: TPE only sees TRAIN scores.
-    Test scores are computed but stored as trial attributes
-    for post-hoc OOS validation — they do NOT influence the
-    optimization direction.
-
-    Aggregation: pessimistic (min across all coin×window combos).
-    This forces parameters to work in the WORST case, not just average.
+    Key anti-overfit properties:
+      - TPE only sees TRAIN scores. Test scores stored as attributes.
+      - Rolling walk-forward: equal-length folds, later market regimes tested freshly.
+      - Trimmed-mean aggregation: drop the single worst window before averaging.
+        Prevents one anomalous flash-crash window from eliminating good params.
+      - Cross-coin CV penalty: params that work on ETH but not SOL pay a price.
     """
     params = sample_params(trial)
 
     train_scores = []
-    test_scores = []
+    test_scores  = []
 
     for coin, df in CACHED_DATA.items():
-        splits = split_anchored_walk_forward(df, n_windows=N_WINDOWS)
+        splits = split_rolling_walk_forward(df, n_windows=N_WINDOWS)
 
         for w_idx, (train_df, test_df) in enumerate(splits):
-            # ─── TRAIN evaluation (this is what TPE optimizes) ───
+            # ─── TRAIN evaluation (what TPE optimizes) ──────────
             train_metrics = run_strategy(train_df, params)
             if train_metrics is None:
                 return -10.0
 
             train_score = composite_fitness(train_metrics)
             if train_score <= -10.0:
-                return -10.0  # Hard fail: blow-up on train
+                return -10.0   # Hard fail on train
 
             train_scores.append(train_score)
 
-            # ─── TEST evaluation (stored, NOT used for optimization) ───
+            # ─── TEST evaluation (stored, NOT used for TPE) ─────
             test_metrics = run_strategy(test_df, params)
             if test_metrics is not None:
                 test_score = composite_fitness(test_metrics)
                 test_scores.append(test_score)
-
-                # Store as trial attribute for post-hoc analysis
                 trial.set_user_attr(
                     f'oos_{coin}_{w_idx}',
                     {
-                        'test_score': round(test_score, 4),
+                        'test_score':  round(test_score, 4),
                         'test_return': test_metrics.get('total_return_pct', 0),
-                        'test_dd': test_metrics.get('max_drawdown_pct', 0),
-                        'test_pf': test_metrics.get('profit_factor', 0),
+                        'test_dd':     test_metrics.get('max_drawdown_pct', 0),
+                        'test_pf':     test_metrics.get('profit_factor', 0),
+                        'test_sortino':test_metrics.get('sortino_ratio', 0),
                         'test_trades': test_metrics.get('total_trades', 0),
                     }
                 )
@@ -220,22 +281,44 @@ def objective(trial):
     if not train_scores:
         return -10.0
 
-    # ─── Pessimistic aggregation: use MIN, not mean ───
-    # This forces params to work in worst-case window, not just average.
-    # Prevents "great on window 1, terrible on window 3" solutions.
-    min_train = min(train_scores)
+    # ─── Trimmed-mean aggregation ────────────────────────────
+    # Drop the single worst window, then average the rest.
+    # Prevents one anomalous crash window from killing good params.
+    # With ≥ 3 windows this gives a robust central tendency estimate.
+    if len(train_scores) > 2:
+        sorted_scores = sorted(train_scores)
+        trimmed = sorted_scores[1:]          # drop 1 worst
+    else:
+        trimmed = train_scores               # too few to trim
 
-    # Also store mean for reference
+    agg_score = float(np.mean(trimmed))
+
+    # ─── Cross-coin CV stability penalty ─────────────────────
+    # Penalize params that produce high variance across coins.
+    # CV = std/|mean|. High CV → params are coin-specific, not general.
+    if len(train_scores) >= 2:
+        arr = np.array(train_scores)
+        mean_abs = max(abs(np.mean(arr)), 1e-6)
+        cv = np.std(arr) / mean_abs
+        cv_penalty = np.clip(cv * 0.3, 0.0, 1.5)   # max 1.5 point penalty
+        agg_score -= cv_penalty
+    else:
+        cv_penalty = 0.0
+
+    # ─── Store diagnostics ───────────────────────────────────
     trial.set_user_attr('train_scores', [round(s, 4) for s in train_scores])
-    trial.set_user_attr('test_scores', [round(s, 4) for s in test_scores])
-    trial.set_user_attr('train_min', round(min_train, 4))
-    trial.set_user_attr('train_mean', round(np.mean(train_scores), 4))
+    trial.set_user_attr('test_scores',  [round(s, 4) for s in test_scores])
+    trial.set_user_attr('train_trimmed_mean', round(agg_score + cv_penalty, 4))
+    trial.set_user_attr('train_mean',   round(float(np.mean(train_scores)), 4))
+    trial.set_user_attr('train_min',    round(min(train_scores), 4))
+    trial.set_user_attr('cv_penalty',   round(cv_penalty, 4))
 
     if test_scores:
-        trial.set_user_attr('test_min', round(min(test_scores), 4))
-        trial.set_user_attr('test_mean', round(np.mean(test_scores), 4))
+        trial.set_user_attr('test_min',  round(min(test_scores), 4))
+        trial.set_user_attr('test_mean', round(float(np.mean(test_scores)), 4))
 
-    return min_train
+    return agg_score
+
 
 
 # ─── Parameter Sampling ──────────────────────────────────────
@@ -539,21 +622,28 @@ def main():
 
     # Show walk-forward layout
     print(f"\n{'─'*60}")
-    print(f"  Walk-Forward Layout ({N_WINDOWS} anchored windows)")
+    print(f"  Walk-Forward Layout ({N_WINDOWS} rolling windows)")
     print(f"{'─'*60}")
     sample_coin = list(CACHED_DATA.keys())[0]
     sample_df = CACHED_DATA[sample_coin]
-    splits = split_anchored_walk_forward(sample_df, n_windows=N_WINDOWS)
+    splits = split_rolling_walk_forward(sample_df, n_windows=N_WINDOWS)
+    n = len(sample_df)
+    chunk = n // N_WINDOWS
+    train_len = int(chunk * 0.7)
+    total_covered = 0
     for w_idx, (train_df, test_df) in enumerate(splits):
-        print(f"  W{w_idx}: Train [{0:>6}..{len(train_df):>6}] "
+        fold_start  = w_idx * chunk
+        train_end   = fold_start + train_len
+        test_end    = (w_idx + 1) * chunk if w_idx < N_WINDOWS - 1 else n
+        total_covered = max(total_covered, test_end)
+        print(f"  W{w_idx}: Train [{fold_start:>6}..{train_end:>6}] "
               f"({len(train_df):,} bars) | "
-              f"Test [{len(sample_df) - len(test_df) - (len(sample_df) - len(train_df) - len(test_df)):>6}.."
-              f"{len(sample_df) - (len(sample_df) - len(train_df) - len(test_df)):>6}] "
+              f"Test [{train_end:>6}..{test_end:>6}] "
               f"({len(test_df):,} bars)")
-    print(f"  Total: {len(sample_df):,} bars covered")
+    print(f"  Total: {total_covered:,} bars covered")
 
-    print(f"\n  Fitness: Composite = Calmar × sqrt(ProfitFactor)")
-    print(f"  Aggregation: MIN across windows (pessimistic)")
+    print(f"\n  Fitness:     H(Sortino, Calmar) × √PF × consistency_factor")
+    print(f"  Aggregation: trimmed-mean (drop worst 1 window) + CV stability penalty")
     print(f"  Optimization target: TRAIN only (OOS held out)")
     print(f"  Simulation: Slippage {BACKTEST_FILL_CONF.get('slippage_pct', 0)*100:.2f}% | "
           f"Fill Prob {BACKTEST_FILL_CONF.get('fill_probability', 1)*100:.0f}%")

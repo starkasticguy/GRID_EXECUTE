@@ -24,9 +24,9 @@ A hedge-mode grid trading system on 15-minute candles that dynamically adapts to
 
 ## Status
 
-**Version**: V4.0
+**Version**: V4.2 — Crypto-Native Hardening
 **Status**: Complete (Backtest + Live Execution)
-**Tests**: 121/121 passing (57 backtest + 64 live)
+**Tests**: 130/130 passing (all suites)
 **Architecture**: Pure Python/NumPy (Numba-ready structure for future acceleration)
 
 ---
@@ -76,10 +76,12 @@ GRID_Trade/
 │   ├── __init__.py
 │   ├── kama.py                  # KAMA, ER, 5-state Regime FSM
 │   ├── atr.py                   # ATR (Wilder's), Z-Score, Rolling Volatility
-│   ├── grid.py                  # Grid level generation, dynamic ATR spacing
+│   ├── adx.py                   # ADX (Average Directional Index) — veto filter [NEW]
+│   ├── grid.py                  # Grid level generation, geometric spacing, round-number avoidance
 │   ├── inventory.py             # Full Avellaneda-Stoikov model
-│   ├── risk.py                  # Tiered margin, iterative liquidation, VaR
-│   └── funding.py               # Synthetic funding rate simulation
+│   ├── risk.py                  # Tiered margin, liquidation, VaR, portfolio correlation VaR
+│   ├── funding.py               # Synthetic funding rate + funding-aware order sizing
+│   └── kelly.py                 # Quarter-Kelly regime-filtered position sizing [NEW]
 │
 ├── engine/                      # Execution logic
 │   ├── __init__.py
@@ -226,14 +228,19 @@ Two independent position trackers:
 ```
 for each bar i (starting from 1):
     1. REGIME        - Read from pre-computed indicators[i-1] (no lookahead)
+                       ADX veto: if ADX < 25, TREND overridden to NOISE
     2. CIRCUIT BREAK  - Halt if Z < -3, resume if Z > -1
-    3. STOP LOSS      - 2-stage ATR stops: 50% close at 1× mult, remainder at 1.5× (multi-fill)
+    3. STOP LOSS      - 2-stage ATR stops: Stage 1 fires on candle CLOSE (anti-wick)
+                       Stage 2 uses wick as safety net. Cooldown tracks consecutive stops.
     4. LIQUIDATION     - Check if leveraged positions hit liquidation price
     5. PRUNING         - Run 5-method cycle on both sides
+                       + VaR pre-emptive: force-prune worst loser at 75% drawdown cap
     6. TRAILING UP     - Shift grid anchor upward in uptrends
     7. VaR CHECK       - Block new orders if VaR exceeds limit
-    8. GRID GENERATE   - A-S skewed grid (T=96, meaningful ~$2 skew on ETH); regen only on
-                          price drift >1 spacing or regime change (not every fill)
+    8. GRID GENERATE   - Quarter-Kelly + de-scaling multiplier applied to order_pct
+                         Weekend/low-vol de-scaling on max_position_pct
+                         Geometric grid levels with round-number avoidance
+                         Funding-aware order sizing tilt in NOISE regime
     9. FILL MATCHING   - Conservative: Buy if Low <= Price, Sell if High >= Price
    10. FUNDING RATE    - Apply every 32 bars (8h intervals)
    11. LOG EQUITY      - Wallet + unrealized PnL both sides
@@ -244,16 +251,19 @@ for each bar i (starting from 1):
 ## Key Parameters (config.py)
 
 ```python
-# Regime Detection
+# Regime Detection (KAMA/ER + ADX Veto)
 'kama_period': 10           # ER lookback (150 min)
 'regime_threshold': 0.15    # KAMA slope theta
 'er_trend_threshold': 0.5   # ER above = trend
+'adx_period': 14            # ADX lookback (Wilder's)
+'adx_trend_threshold': 25.0 # Below = force NOISE (fakeout defense)
 
 # Grid
 'grid_spacing_k': 1.0       # spacing = k * ATR
 'grid_levels': 10            # Levels per side
-'order_pct': 0.03            # 3% capital per fill
+'order_pct': 0.05            # 5% capital per fill (Quarter-Kelly scales this down)
 'spacing_floor': 0.005       # Min 0.5% of price
+'grid_mode': 'geometric'     # 'geometric' (pct-spaced, round-num avoidance) or 'arithmetic'
 
 # Inventory (Avellaneda-Stoikov)
 'gamma': 0.5                 # Risk aversion
@@ -279,10 +289,17 @@ for each bar i (starting from 1):
 'atr_sl_mult': 3.5           # Stop loss (ATR mult)
 'max_position_pct': 0.7      # Max notional per side
 
+# Crypto-Native Risk De-scaling
+'stop_cooldown_bars': 48     # 12h de-scale after consecutive stops
+'stop_cooldown_thresh': 2    # Stops to trigger cooldown
+'low_volume_threshold': 0.5  # Below 50% of 7d avg = low liquidity → reduce exposure
+'funding_harvest_threshold': 0.0002  # Funding rate tilt threshold in NOISE regime
+'kelly_window': 50           # Rolling trades for Quarter-Kelly sizing
+
 # Execution
 'fee_maker': -0.00005        # -0.005% maker rebate
 'fee_taker': 0.0002          # 0.02% taker fee
-'leverage': 1.0              # 1x default
+'leverage': 5.0              # 5x leverage
 'allow_short': True          # Hedge mode on/off
 ```
 
@@ -302,6 +319,7 @@ PRUNE_OLDEST          # Pruning: fill too old
 PRUNE_GAP             # Pruning: price-fill gap too large
 PRUNE_FUNDING         # Pruning: funding cost too high
 PRUNE_OFFSET          # Pruning: profit-subsidized close
+PRUNE_VAR_WARNING     # Pruning: pre-emptive de-leverage at 75% drawdown cap
 CIRCUIT_BREAKER_HALT  # Trading halted (Z < -3)
 LIQUIDATION           # Margin liquidation
 ```
@@ -430,9 +448,11 @@ Read from environment variables `BINANCE_API_KEY` and `BINANCE_API_SECRET`.
 5. Break-even analysis tool
 6. Multi-symbol concurrent live trading
 7. Telegram/Discord alert integration
+8. Live open-interest / liquidation-level monitoring (cascade awareness)
+9. Regime-conditional optimizer parameters (different `grid_spacing_k` per regime type)
 
 ---
 
-**Version**: V4.1
-**Date**: 2026-02-20
-**Status**: Complete (Backtest + Live Execution) - 121/121 tests passing
+**Version**: V4.2
+**Date**: 2026-02-21
+**Status**: Complete (Backtest + Live Execution) — 130/130 tests passing

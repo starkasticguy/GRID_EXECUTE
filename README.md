@@ -1,6 +1,6 @@
 # GridStrategyV4 — Volatility-Adaptive Grid Trading Engine
 
-A hedge-mode grid trading system for cryptocurrency perpetual futures on 15-minute candles. V4 replaces static grid parameters with dynamic, volatility-adaptive architecture driven by KAMA-based regime detection and Avellaneda-Stoikov inventory management.
+A hedge-mode grid trading system for cryptocurrency perpetual futures on 15-minute candles. V4.2 adds 9 crypto-native hardening improvements on top of V4's KAMA-based regime detection and Avellaneda-Stoikov inventory management: ADX veto filter, stop-loss cooldown, candle-close stops, geometric grid with round-number avoidance, Quarter-Kelly sizing, VaR pre-emptive de-leverage, weekend de-scaling, funding harvesting sizing, and portfolio correlation VaR.
 
 ## Why This Exists
 
@@ -23,15 +23,16 @@ V4 addresses each failure with a dedicated mechanism.
   - [Efficiency Ratio (ER)](#efficiency-ratio-er)
   - [KAMA (Kaufman Adaptive Moving Average)](#kama-kaufman-adaptive-moving-average)
   - [ATR (Average True Range)](#atr-average-true-range)
+  - [ADX (Average Directional Index)](#adx-average-directional-index)
   - [Regime Detection (Finite State Machine)](#regime-detection-finite-state-machine)
   - [Z-Score (Circuit Breaker Signal)](#z-score-circuit-breaker-signal)
   - [Rolling Volatility](#rolling-volatility)
 - [Grid Layer: How Orders Are Placed](#grid-layer-how-orders-are-placed)
   - [Dynamic Spacing](#dynamic-spacing)
   - [Grid Level Generation](#grid-level-generation)
-  - [Order Sizing](#order-sizing)
+  - [Order Sizing (Quarter-Kelly)](#order-sizing-quarter-kelly)
   - [Avellaneda-Stoikov Inventory Skew](#avellaneda-stoikov-inventory-skew)
-  - [Funding Rate Bias](#funding-rate-bias)
+  - [Funding Rate Bias and Harvesting](#funding-rate-bias-and-harvesting)
 - [Execution Layer: How Trades Happen](#execution-layer-how-trades-happen)
   - [Hedge Mode (Dual Positions)](#hedge-mode-dual-positions)
   - [Virtual Order Book](#virtual-order-book)
@@ -39,16 +40,14 @@ V4 addresses each failure with a dedicated mechanism.
   - [Trade Labels](#trade-labels)
 - [Protection Layer: How the Strategy Defends Capital](#protection-layer-how-the-strategy-defends-capital)
   - [Circuit Breaker](#circuit-breaker)
-  - [ATR Stop Loss](#atr-stop-loss)
+  - [ATR Stop Loss (with Candle-Close Anti-Wick + Cooldown)](#atr-stop-loss)
   - [Tiered Margin and Liquidation](#tiered-margin-and-liquidation)
-  - [VaR Constraint](#var-constraint)
+  - [VaR Constraint + Pre-emptive De-Leverage](#var-constraint)
+  - [Weekend / Low-Liquidity De-Scaling](#weekend--low-liquidity-de-scaling)
   - [Trailing Up](#trailing-up)
   - [Five-Method Pruning](#five-method-pruning)
 - [Main Loop: Step-by-Step Execution](#main-loop-step-by-step-execution)
 - [Backtesting: How We Avoid Lies](#backtesting-how-we-avoid-lies)
-  - [Lookahead-Free Design](#lookahead-free-design)
-  - [Conservative Fill Model](#conservative-fill-model)
-  - [Fee and Funding Simulation](#fee-and-funding-simulation)
 - [Optimizer: How Parameters Are Chosen](#optimizer-how-parameters-are-chosen)
 - [Metrics: What We Measure](#metrics-what-we-measure)
 - [Parameter Reference](#parameter-reference)
@@ -204,6 +203,35 @@ ATR_t = alpha * TR_t + (1 - alpha) * ATR_{t-1}
 
 ---
 
+### ADX (Average Directional Index)
+
+**File**: `core/adx.py` | **Function**: `calculate_adx()`
+
+ADX measures trend *strength* on a scale of 0-100, but unlike KAMA it has no directional bias. It answers: "Is the market actually trending, or is a directional move just noise?"
+
+**Calculation (Wilder's smoothing):**
+
+```
++DM = max(High_t - High_{t-1}, 0) if > abs(Low_t - Low_{t-1}), else 0
+-DM = max(Low_{t-1} - Low_t, 0) if > abs(High_t - High_{t-1}), else 0
++DI = 100 * RMA(+DM, period) / ATR
+-DI = 100 * RMA(-DM, period) / ATR
+DX  = 100 * |+DI - -DI| / (+DI + -DI)
+ADX = RMA(DX, period)         # Wilder's smoothed DX
+```
+
+**Interpretation:**
+- `ADX < 20`: No real trend (sideways chop or just starting)
+- `ADX 20–25`: Borderline — possible trend forming
+- `ADX > 25`: Confirmed trend direction
+- `ADX > 40`: Strong trend
+
+**V4.2 use — ADX Veto Filter**: If GMM or KAMA classifies the market as UPTREND or DOWNTREND but `ADX < adx_trend_threshold` (default 25), the regime is **forced to NOISE**. This prevents the strategy from taking one-sided trend positions during high-volatility crypto chop, which looks like a trend on KAMA slope alone but has no genuine directional momentum.
+
+**Default**: `adx_period = 14`, `adx_trend_threshold = 25.0`
+
+---
+
 ### Regime Detection (Finite State Machine)
 
 **File**: `core/kama.py` | **Function**: `detect_regime()`
@@ -307,32 +335,43 @@ spacing = max(k * ATR, floor * price)
 
 ### Grid Level Generation
 
-**File**: `core/grid.py` | **Function**: `generate_grid_levels()`
+**File**: `core/grid.py` | **Functions**: `generate_geometric_grid_levels()`, `generate_grid_levels()`
 
-Arithmetic grid centered on anchor price:
+V4.2 defaults to **geometric** (percentage-based) spacing (`grid_mode = 'geometric'`):
 
 ```
-Buy levels:  anchor - spacing * 1, anchor - spacing * 2, ..., anchor - spacing * N
-Sell levels: anchor + spacing * 1, anchor + spacing * 2, ..., anchor + spacing * N
+Buy levels:  anchor / (1 + pct%)^i   for i = 1..N
+Sell levels: anchor * (1 + pct%)^i   for i = 1..N
 ```
 
-Note: The anchor is the Avellaneda-Stoikov reservation price `r`, not the current market price. This is how inventory skew enters the grid.
+Geometric spacing naturally widens outer levels — appropriate for crypto where distant reversions are less certain than nearby ones.
+
+**Round-Number Avoidance**: After computing each level, a helper nudges any price landing within 0.1% of a round number (e.g., $60,000, $65,000) outward by 0.15%. These round numbers are known stop-hunt magnets and placing grid orders there leads to premature fills on stop-hunt wicks.
+
+The arithmetic grid (`generate_grid_levels()`) is still available via `grid_mode = 'arithmetic'`.
 
 ---
 
-### Order Sizing
+### Order Sizing (Quarter-Kelly)
 
-**File**: `core/grid.py` | **Function**: `calculate_order_qty()`
+**File**: `core/kelly.py` + `core/grid.py` | **Function**: `compute_kelly_fraction()`
 
-Each grid fill uses a fixed fraction of capital:
+Order size adapts dynamically to recent strategy edge rather than using a fixed `order_pct`:
 
 ```
-qty = (Capital * order_pct * leverage) / price
+Kelly = (W% / AvgLoss) - ((1 - W%) / AvgWin)
+Quarter-Kelly = Kelly * 0.25           # Crypto safety factor
+effective_order_pct = order_pct * max(Quarter-Kelly, 0.25)
 ```
 
-**Default**: `order_pct = 0.03` (3% of capital per fill), `leverage = 1.0`
+- Computed from the last `kelly_window` (default 50) regime-filtered trades
+- Quarter-Kelly (25%) accounts for crypto's auto-correlated return distribution
+- Falls back to `order_pct * 0.5` if trade history is insufficient
+- Combined multiplicatively with stop-loss cooldown de-scaling when both are active
 
-With 10 grid levels and 3% per fill, a fully loaded one-side position uses 30% of capital.
+Fixed sizing (`calculate_order_qty()`) is unchanged for take-profit quantity calculation.
+
+**Default base**: `order_pct = 0.05` (5%), `kelly_window = 50`
 
 ---
 
@@ -386,22 +425,24 @@ Position size is divided by max allowed inventory per side, then clamped to [-1,
 
 ---
 
-### Funding Rate Bias
+### Funding Rate Bias and Harvesting
 
-**File**: `core/funding.py`
+**File**: `core/funding.py` + `engine/strategy.py`
 
-In perpetual futures, funding rates create a carry cost/income. In NOISE regime (where the grid is most active), V4 biases the grid toward the side that receives funding:
+In perpetual futures, funding rates create a carry cost/income. V4.2 handles this in two ways:
 
-**Synthetic funding rate model:**
+**Grid Bias (NOISE regime — spacing adjustment):**
+- Positive funding: Widen long grid by 1.2×, tighten short (favor shorts which receive funding)
+- Negative funding: Tighten long grid, widen short (favor longs)
+
+**Funding Harvesting Sizing (new in V4.2, NOISE regime only):**
+When `|funding_rate| > funding_harvest_threshold` (default 0.02%), order size on the *receiving* side is increased by 25% and reduced by 25% on the *paying* side. This is applied after Kelly sizing, creating a genuine alpha edge from persistent funding skew without directional betting.
+
 ```
-deviation = (Close - SMA_96) / SMA_96
-rate = base_rate + sensitivity * deviation * base_rate
-rate = clamp(rate, -0.03%, +0.03%)
+If funding_rate > 0 (shorts receive):
+    short_order_pct = min(order_pct * 1.25, order_pct * 1.5)
+    long_order_pct  = max(order_pct * 0.75, order_pct * 0.5)
 ```
-
-**Grid bias (NOISE regime only):**
-- Positive funding (price > spot): Widen long grid by 1.2x, tighten short grid by 0.8x (favor shorts which receive funding)
-- Negative funding (price < spot): Tighten long grid by 0.8x, widen short grid by 1.2x (favor longs which receive funding)
 
 **Funding application:** Every 32 bars (8 hours on 15m candles), funding is applied to all open positions. The cost is distributed across fills for funding-based pruning.
 
@@ -479,6 +520,7 @@ Every trade is tagged with a descriptive label:
 | `PRUNE_GAP` | Position pruned: price-fill gap too large |
 | `PRUNE_FUNDING` | Position pruned: funding cost too high |
 | `PRUNE_OFFSET` | Position pruned: profit-subsidized close |
+| `PRUNE_VAR_WARNING` | Position pruned: pre-emptive de-leverage at 75% drawdown cap |
 | `CIRCUIT_BREAKER_HALT` | Trading halted due to crash |
 | `LIQUIDATION` | Margin call (leveraged accounts only) |
 
@@ -519,11 +561,11 @@ Long stop:  avg_entry - 1.5 * atr_sl_mult * ATR    → close remaining position
 Short stop: avg_entry + 1.5 * atr_sl_mult * ATR    → close remaining position
 ```
 
-A single-fill position always closes 100% at Stage 1 (no point splitting one fill).
+**V4.2 — Candle-Close Stage 1 Stops (Anti-Wick)**: Stage 1 partial stop only fires when the *candle close price* crosses the stop level. Stage 2 still uses the wick (high/low) as a safety net. This prevents premature Stage 1 exits during flash crash wicks that recover fully within a single 15m bar.
 
-This prevents the pattern of accumulating several fills then losing them all in a single stop event. Stage 1 reduces risk immediately; Stage 2 gives the remaining position room to recover before closing.
+**V4.2 — Stop-Loss Cooldown**: After `stop_cooldown_thresh` (default 2) consecutive stops within `stop_cooldown_bars` (default 48 = 12h), `order_pct` is halved for the next 48 bars. This prevents the strategy from re-entering at full size during a liquidation cascade and compounds the de-scaling with the Quarter-Kelly multiplier.
 
-**Default**: `atr_sl_mult = 3.0` (3.0x ATR for first stage, 4.5x for second stage)
+**Default**: `atr_sl_mult = 3.5` (3.5× ATR for first stage, 5.25× for second stage)
 
 ---
 
@@ -564,7 +606,7 @@ Since MMR depends on notional (= P_liq * Qty), which depends on P_liq, this is s
 
 ---
 
-### VaR Constraint
+### VaR Constraint + Pre-emptive De-Leverage
 
 **File**: `core/risk.py` | **Function**: `check_var_constraint()`
 
@@ -574,11 +616,35 @@ Value at Risk caps total exposure:
 VaR_95 = Total_Exposure * 1.65 * sigma_15m
 ```
 
-The 1.65 multiplier corresponds to the 95th percentile of a normal distribution.
+**Hard rule**: If `VaR_95 > max_drawdown_pct * equity`, no new grid orders are placed.
 
-**Hard rule**: If `VaR_95 > max_drawdown_pct * equity`, no new grid orders are placed. This prevents the strategy from taking on excessive risk during volatile periods.
+**V4.2 — Pre-emptive De-Leverage**: When unrealized drawdown reaches 75% of `max_drawdown_pct` (i.e., 11.25% on a 15% cap), the strategy force-closes the single worst-performing fill on each side. This provides a gradual ramp-down rather than a sudden hard stop when the limit is hit.
+
+```
+if (initial_capital - current_equity) / initial_capital > max_drawdown_pct * 0.75:
+    find worst_fill (largest unrealized loss per side)
+    close it at market → tagged PRUNE_VAR_WARNING
+```
+
+**Portfolio VaR** (`core/risk.py::compute_portfolio_var`): For multi-coin live trading, computes cross-asset correlation. When BTC/ETH/SOL correlation exceeds 0.80 (crypto panic correlation), treats the entire book as one concentrated position for VaR purposes.
 
 **Default**: `max_drawdown_pct = 0.15` (15% of equity)
+
+---
+
+### Weekend / Low-Liquidity De-Scaling
+
+**File**: `engine/strategy.py`
+
+Crypto weekends and low-volume periods have reduced liquidity, wider spreads, and higher susceptibility to flash crashes. V4.2 auto-detects low-liquidity periods using rolling volume:
+
+```
+vol_sma7 = rolling mean of volume over last 7 days (7 × 96 bars)
+if current_volume < low_volume_threshold * vol_sma7:
+    max_position_pct *= 0.70   # 30% smaller maximum position
+```
+
+No external APIs or calendar lookups are needed — it uses existing OHLCV volume data. The threshold `low_volume_threshold = 0.5` triggers when current volume is below 50% of the 7-day moving average.
 
 ---
 
@@ -655,15 +721,17 @@ For every bar from index 1 to N:
 
 ```
 1. READ REGIME         Use indicators from bar i-1 (KAMA, ER, ATR, Z-Score)
+                       ADX veto: if ADX < 25, all TREND signals overridden to NOISE
                        Current bar i provides only OHLC for fill matching
 
 2. CIRCUIT BREAKER     If Z < -3.0: cancel all orders, set halted=True
                        If halted and Z > -1.0: set halted=False, regen grid
                        If halted: update equity, skip to next bar
 
-3. STOP LOSS           Long: if Low <= entry - atr_sl_mult*ATR:
-                           Multi-fill: close 50%, widen stop to 1.5x
-                           Single fill: close 100%
+3. STOP LOSS           Long: Stage 1 (candle CLOSE <= stop level, anti-wick):
+                           Multi-fill: close 50%, widen stop to 1.5×
+                       Stage 2 (wick Low <= stop level) or single fill: close 100%
+                       Consecutive stop counter: ≥2 stops in 48 bars → halve order_pct
                        Short: symmetric
 
 4. LIQUIDATION         If leveraged: check if price hit liquidation level
@@ -671,6 +739,7 @@ For every bar from index 1 to N:
 
 5. PRUNING             For both long and short positions:
                        Run 5-method cycle, close targeted fill if triggered
+                       + VaR pre-emptive: if drawdown > 75% of cap, close worst loser
 
 6. TRAILING UP         If UPTREND/BREAKOUT_UP and ER > threshold:
                        If price > top grid level, shift anchor up 50%
@@ -680,15 +749,18 @@ For every bar from index 1 to N:
 
 8. GRID GENERATION     If grid_needs_regen flag set AND VaR allows:
                          Cancel old orders
-                         Calculate A-S reservation price (T=96, real skew)
+                         Compute Quarter-Kelly multiplier from last 50 regime-filtered trades
+                         Apply stop-loss cooldown de-scaling if active
+                         Apply weekend/low-vol de-scaling to max_position_pct
+                         Calculate A-S reservation price (T=96)
+                         Apply funding-aware sizing tilt in NOISE regime
+                         Geometric grid levels with round-number avoidance
                          Place buy entries + sell TPs for long grid
                          Place sell entries + buy TPs for short grid
-                         Filter by regime (no longs in downtrend, etc.)
-                       Flag is set on: stop/prune/trailing/CB-resume OR
-                         fill + price drifted >1 spacing from anchor
 
 9. FILL MATCHING       Check each pending order against bar's High/Low
                        Process fills: update position, track PnL
+                       Update Kelly trade history on PnL-generating fills
 
 10. FUNDING RATE       Every 32 bars (8h): apply funding to all positions
                        Distribute cost to fills for funding pruning

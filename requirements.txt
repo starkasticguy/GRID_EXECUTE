@@ -6,3 +6,5 @@ matplotlib
 pyarrow
 pytest
 python-dotenv
+hmmlearn
+scikit-learn

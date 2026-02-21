@@ -148,3 +148,81 @@ def calculate_funding_pnl(position_size: float, mark_price: float,
         return -fee  # Long pays
     else:
         return fee   # Short receives
+
+
+def compute_portfolio_var(
+    positions: dict,
+    prices: dict,
+    recent_returns: dict,
+    max_drawdown_pct: float,
+    equity: float,
+    corr_window: int = 30,
+    high_corr_threshold: float = 0.80,
+) -> tuple:
+    """
+    Portfolio-level correlation-aware VaR for multi-coin hedge-mode trading.
+
+    In crypto drawdowns, BTC/ETH/SOL correlation spikes to ~0.85.
+    Naive per-coin VaR massively underestimates real tail risk when all
+    positions bleed simultaneously.
+
+    Args:
+        positions   : {coin: position_size_usd}
+        prices      : {coin: current_price}
+        recent_returns: {coin: np.ndarray of last `corr_window` log-returns}
+        max_drawdown_pct: hard cap (e.g. 0.12)
+        equity      : current total equity
+        corr_window : bars for rolling correlation estimate
+        high_corr_threshold: above this → treat as one concentrated position
+
+    Returns:
+        (portfolio_var, is_high_correlation)
+    """
+    coins = [c for c in positions if abs(positions[c]) > 1e-9]
+    if len(coins) == 0:
+        return 0.0, False
+    if len(coins) == 1:
+        c = coins[0]
+        sigma = float(np.std(recent_returns.get(c, np.array([0.0])))) if recent_returns.get(c) is not None else 0.0
+        return abs(positions[c]) * 1.65 * sigma, False
+
+    # Build correlation matrix from recent returns
+    ret_arrays = []
+    for c in coins:
+        arr = recent_returns.get(c)
+        if arr is not None and len(arr) >= 5:
+            ret_arrays.append(arr[-corr_window:])
+        else:
+            ret_arrays.append(np.zeros(corr_window))
+
+    try:
+        stacked = np.vstack(ret_arrays)          # (n_coins, window)
+        corr_matrix = np.corrcoef(stacked)       # (n_coins, n_coins)
+    except Exception:
+        corr_matrix = np.eye(len(coins))
+
+    # Average off-diagonal correlation (crisis indicator)
+    n = len(coins)
+    if n > 1:
+        off_diag = (corr_matrix.sum() - n) / (n * (n - 1))
+    else:
+        off_diag = 0.0
+
+    is_high_corr = float(off_diag) > high_corr_threshold
+
+    if is_high_corr:
+        # Treat as one concentrated position: sum all exposure
+        total_exposure = sum(abs(positions[c]) for c in coins)
+        avg_sigma = float(np.mean([
+            np.std(recent_returns.get(c, np.array([0.01]))) for c in coins
+        ]))
+        portfolio_var = total_exposure * 1.65 * avg_sigma
+    else:
+        # Independent per-coin VaR (sum of squares → sqrt)
+        var_sq = 0.0
+        for c in coins:
+            sigma = float(np.std(recent_returns.get(c, np.array([0.01]))))
+            var_sq += (abs(positions[c]) * 1.65 * sigma) ** 2
+        portfolio_var = float(np.sqrt(max(var_sq, 0.0)))
+
+    return portfolio_var, is_high_corr

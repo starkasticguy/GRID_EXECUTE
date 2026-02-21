@@ -35,10 +35,10 @@ def build_paired_trade_log(trades: list) -> pd.DataFrame:
     # Classify trades
     EXIT_LONG_LABELS = {'SELL_CLOSE_LONG', 'STOP_LONG', 'LIQUIDATION',
                         'PRUNE_DEVIANCE', 'PRUNE_OLDEST', 'PRUNE_GAP',
-                        'PRUNE_FUNDING', 'PRUNE_OFFSET'}
+                        'PRUNE_FUNDING', 'PRUNE_OFFSET', 'PRUNE_VAR_WARNING'}
     EXIT_SHORT_LABELS = {'BUY_CLOSE_SHORT', 'STOP_SHORT', 'LIQUIDATION',
                          'PRUNE_DEVIANCE', 'PRUNE_OLDEST', 'PRUNE_GAP',
-                         'PRUNE_FUNDING', 'PRUNE_OFFSET'}
+                         'PRUNE_FUNDING', 'PRUNE_OFFSET', 'PRUNE_VAR_WARNING'}
 
     # FIFO queues for unmatched entries
     long_entries = []
@@ -158,7 +158,140 @@ def save_trade_log(coin: str, paired_df: pd.DataFrame, raw_trades: list,
     print(f"  Summary saved to {summary_path}")
 
 
+# ─── DAILY METRICS ─────────────────────────────────────────────────
+
+def compute_daily_metrics(df: pd.DataFrame, equity_curve: np.ndarray,
+                          trades: list, regime_log: np.ndarray) -> pd.DataFrame:
+    """
+    Compute per-calendar-day metrics from the backtest output.
+
+    Each row represents one trading day with:
+    - Open/close equity and PnL for the day
+    - Dominant regime (most frequent bar in that day)
+    - Trade/stop/prune/CB event counts
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    # Build bar-level DataFrame
+    timestamps = pd.to_datetime(df['timestamp'].values.astype(np.float64), unit='ms')
+    bar_df = pd.DataFrame({
+        'date': timestamps.date,
+        'equity': equity_curve[:len(timestamps)],
+        'regime': regime_log[:len(timestamps)],
+    })
+
+    # ── Equity per day ──────────────────────────────────────────────
+    day_equity = (
+        bar_df.groupby('date')['equity']
+        .agg(start_eq='first', end_eq='last')
+        .reset_index()
+    )
+
+    # ── Dominant regime per day ─────────────────────────────────────
+    regime_mode = (
+        bar_df.groupby('date')['regime']
+        .agg(lambda x: x.mode().iloc[0] if len(x) > 0 else 0)
+        .reset_index()
+        .rename(columns={'regime': 'dominant_regime'})
+    )
+
+    # ── Trade-level stats per day ───────────────────────────────────
+    trade_rows = []
+    for t in trades:
+        ts = pd.to_datetime(t['timestamp'], unit='ms')
+        lbl = t.get('label', '')
+        trade_rows.append({
+            'date': ts.date(),
+            'is_trade':   int(lbl in {'SELL_CLOSE_LONG', 'BUY_CLOSE_SHORT'}),
+            'is_open':    int(lbl in {'BUY_OPEN_LONG', 'SELL_OPEN_SHORT'}),
+            'is_stop':    int('STOP' in lbl),
+            'is_prune':   int('PRUNE' in lbl),
+            'is_cb':      int('CIRCUIT_BREAKER' in lbl),
+            'pnl':        t.get('pnl', 0.0),
+        })
+
+    if trade_rows:
+        t_df = pd.DataFrame(trade_rows)
+        day_trades = (
+            t_df.groupby('date')
+            .agg(
+                tp_closes=('is_trade', 'sum'),
+                entries=('is_open', 'sum'),
+                stops=('is_stop', 'sum'),
+                prunes=('is_prune', 'sum'),
+                cb_events=('is_cb', 'sum'),
+                realized_pnl=('pnl', 'sum'),
+            )
+            .reset_index()
+        )
+    else:
+        day_trades = pd.DataFrame(columns=[
+            'date', 'tp_closes', 'entries', 'stops', 'prunes', 'cb_events', 'realized_pnl'])
+
+    # ── Merge all ───────────────────────────────────────────────────
+    daily = day_equity.merge(regime_mode, on='date', how='left')
+    daily = daily.merge(day_trades, on='date', how='left')
+    daily = daily.fillna(0)
+
+    daily['day_pnl'] = daily['end_eq'] - daily['start_eq']
+    daily['day_return_pct'] = (daily['day_pnl'] / daily['start_eq'].replace(0, np.nan) * 100).fillna(0)
+
+    return daily
+
+
+def print_daily_table(daily: pd.DataFrame):
+    """Print a compact per-day metrics table to the console."""
+    if daily.empty:
+        return
+
+    REGIME_SHORT = {0: 'NOISE', 1: 'UP', -1: 'DOWN', 2: 'BRK↑', -2: 'BRK↓'}
+
+    # Header
+    header = (
+        f"  {'Date':<12} {'Equity':>9} {'Day P&L':>9} {'Ret%':>6}  "
+        f"{'Regime':<6} {'Entr':>5} {'TPs':>5} {'Stp':>4} {'Prn':>4} {'CB':>4}"
+    )
+    sep = '  ' + '─' * (len(header) - 2)
+
+    print(f"\n  {'─'*58}")
+    print(f"  Daily Breakdown")
+    print(f"  {'─'*58}")
+    print(header)
+    print(sep)
+
+    total_pnl = 0.0
+    for _, row in daily.iterrows():
+        regime_name = REGIME_SHORT.get(int(row['dominant_regime']), '?    ')
+        pnl = row['day_pnl']
+        total_pnl += pnl
+        pnl_str = f"${pnl:+.2f}"
+        ret_str  = f"{row['day_return_pct']:+.2f}%"
+
+        # Color hint via symbol prefix
+        marker = '▲' if pnl > 0 else ('▼' if pnl < 0 else ' ')
+
+        print(
+            f"  {str(row['date']):<12} "
+            f"${row['end_eq']:>8,.2f} "
+            f"{pnl_str:>9} "
+            f"{ret_str:>7}  "
+            f"{regime_name:<6} "
+            f"{int(row['entries']):>5} "
+            f"{int(row['tp_closes']):>5} "
+            f"{int(row['stops']):>4} "
+            f"{int(row['prunes']):>4} "
+            f"{int(row['cb_events']):>4}  {marker}"
+        )
+
+    print(sep)
+    sign = '+' if total_pnl >= 0 else ''
+    print(f"  {'TOTAL':<12} {'':>9} {f'${sign}{total_pnl:.2f}':>9}")
+    print(f"  {'─'*58}")
+
+
 # ─── CONSOLE OUTPUT ────────────────────────────────────────────────
+
 
 def print_metrics(coin: str, metrics: dict):
     """Print formatted metrics table."""
@@ -692,8 +825,14 @@ def main():
         # Print metrics
         print_metrics(coin, result['metrics'])
 
+        # Compute and print daily breakdown
+        daily = compute_daily_metrics(df, result['equity_curve'],
+                                      result['trades'], result['regime_log'])
+        print_daily_table(daily)
+
         # Print trade log summary
         print_trade_log_summary(paired_df)
+
 
         # Save trade logs + summary
         save_trade_log(coin, paired_df, result['trades'],
