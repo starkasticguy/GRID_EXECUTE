@@ -19,7 +19,7 @@ STRATEGY_PARAMS = {
     'use_ml_regime': True,         # Use Gaussian Mixture Model for state classification instead of KAMA
 
     # ─── Grid ────────────────────────────────────────────────
-    'grid_spacing_k': 1.27491,              # ETH-tuned: 1.6×ATR ≈ $24-26 spacing at $1500-3000. ETH's smoother candles fill TPs at this range
+    'grid_spacing_k': 1.05,              # ETH-tuned: 1.6×ATR ≈ $24-26 spacing at $1500-3000. ETH's smoother candles fill TPs at this range
     'grid_levels': 8,               # Levels per side (was 2 — one extra level for more grid cycles)
     'max_orders': 500,              # Max simultaneous orders
     'spacing_floor': 0.00450328,         # Min spacing (0.6% of price, was 0.5%)
