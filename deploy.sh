@@ -66,6 +66,11 @@ if [ -n "$CAPITAL" ]; then
   CAPITAL_ARG="--capital $CAPITAL"
 fi
 
+LEVERAGE_ARG=""
+if [ -n "$LEVERAGE" ]; then
+  LEVERAGE_ARG="--leverage $LEVERAGE"
+fi
+
 info "Deploying to $SERVER..."
 
 ssh "$SERVER" bash << REMOTE
@@ -104,7 +109,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/GRID_EXECUTE
 EnvironmentFile=/root/GRID_EXECUTE/.env
-ExecStart=/root/GRID_EXECUTE/venv/bin/python3 live_trade.py --coin ${COIN} --leverage ${LEVERAGE} --resume ${CAPITAL_ARG}
+ExecStart=/root/GRID_EXECUTE/venv/bin/python3 live_trade.py --coin ${COIN} ${LEVERAGE_ARG} --resume ${CAPITAL_ARG}
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure
