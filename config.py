@@ -11,30 +11,30 @@ STRATEGY_PARAMS = {
     'kama_slow': 30,                # Slow EMA period for KAMA
     'atr_period': 14,               # ATR lookback
     'adx_period': 14,               # ADX lookback (Wilder's standard)
-    'adx_trend_threshold': 34.3383,    # ADX below this = no real trend (NOISE override)
+    'adx_trend_threshold': 31.1022,    # ADX below this = no real trend (NOISE override)
     'regime_threshold': 0.0500612,       # θ for KAMA slope FSM (was 0.15 — less sensitive)
     'er_trend_threshold': 0.679668,     # ER above this = trend regime (was 0.5 — harder to enter trend)
-    'regime_hysteresis_bars': 4,    # Bars to confirm regime change (prevents whipsaw)
+    'regime_hysteresis_bars': 2,    # Bars to confirm regime change (prevents whipsaw)
     'regime_timeframe_mult': 4,     # HTF multiplier for regime (4 = 1H on 15m)
     'use_ml_regime': True,         # Use Gaussian Mixture Model for state classification instead of KAMA
 
     # ─── Grid ────────────────────────────────────────────────
-    'grid_spacing_k': 1.1,              # ETH-tuned: 1.6×ATR ≈ $24-26 spacing at $1500-3000. ETH's smoother candles fill TPs at this range
-    'grid_levels': 8,               # Levels per side (was 2 — one extra level for more grid cycles)
+    'grid_spacing_k': 1.22717,              # ETH-tuned: 1.6×ATR ≈ $24-26 spacing at $1500-3000. ETH's smoother candles fill TPs at this range
+    'grid_levels': 7,               # Levels per side (was 2 — one extra level for more grid cycles)
     'max_orders': 500,              # Max simultaneous orders
-    'spacing_floor': 0.00450328,         # Min spacing (0.6% of price, was 0.5%)
+    'spacing_floor': 0.00426233,         # Min spacing (0.6% of price, was 0.5%)
     'order_pct': 0.07,              # ETH-tuned: 7% per fill × 3 levels = 21% per side (up from 5%)
-    'regen_drift_mult': 1.04053,        # ETH-tuned: tighter regen threshold (1.15× spacing). More grid regens → more TP fills
-    'adaptive_floor_scale': 0.650928,    # Vol-scale for per-coin adaptive floor
-    'tp_concentration': 0.867354,        # Fraction of TP qty at nearest level (rest spread evenly)
+    'regen_drift_mult': 1.05983,        # ETH-tuned: tighter regen threshold (1.15× spacing). More grid regens → more TP fills
+    'adaptive_floor_scale': 0.662188,    # Vol-scale for per-coin adaptive floor
+    'tp_concentration': 0.818051,        # Fraction of TP qty at nearest level (rest spread evenly)
     'grid_mode': 'geometric',       # 'geometric' (pct-spaced, round-num avoidance) or 'arithmetic'
 
     # ─── Inventory (Avellaneda-Stoikov) ───────────────────────
-    'gamma': 1.24686,                   # Risk aversion (was 1.2)
-    'kappa': 1.83792,                   # Fill probability parameter
+    'gamma': 0.470663,                   # Risk aversion (was 1.2)
+    'kappa': 2.50071,                   # Fill probability parameter
     'skew_factor': 0.8,             # Legacy skew multiplier
-    'max_inventory_per_side': 4,    # Max fills per direction (was 3)
-    'as_time_horizon': 192.919,        # A-S holding time horizon in bars (96 = 24h at 15m)
+    'max_inventory_per_side': 3,    # Max fills per direction (was 3)
+    'as_time_horizon': 279.043,        # A-S holding time horizon in bars (96 = 24h at 15m)
 
     # ─── Trailing Up ──────────────────────────────────────────
     'trailing_enabled': False,
@@ -49,17 +49,17 @@ STRATEGY_PARAMS = {
 
     # ─── Pruning (5-Method Gardener) ──────────────────────────
     'max_position_age_hours': 24,   # Oldest trade pruning (was 39 — free locked capital faster)
-    'deviance_sigma': 3.99983,              # Deviance pruning (was 3.32 — slightly tighter; 2.5 fired too often on SOL)
-    'gap_prune_mult': 3.04177,              # Gap pruning (was 2.45 — tighter with narrower grid)
+    'deviance_sigma': 3.4064,              # Deviance pruning (was 3.32 — slightly tighter; 2.5 fired too often on SOL)
+    'gap_prune_mult': 3.0014,              # Gap pruning (was 2.45 — tighter with narrower grid)
     'funding_cost_ratio': 0.400804,      # Funding pruning threshold
-    'offset_prune_ratio': 3.44696,          # ETH-tuned: buffer must cover 400% of loss (very conservative, fewer bleeds)
-    'prune_cooldown_bars': 20,      # ETH-tuned: 6h cooldown (was 8 = 2h). Holds fills longer → more TP fills
+    'offset_prune_ratio': 4.77626,          # ETH-tuned: buffer must cover 400% of loss (very conservative, fewer bleeds)
+    'prune_cooldown_bars': 24,      # ETH-tuned: 6h cooldown (was 8 = 2h). Holds fills longer → more TP fills
 
     # ─── Risk Management ──────────────────────────────────────
     'max_drawdown_pct': 0.163156,       # VaR hard cap (12% of equity)
     'var_confidence': 0.95,         # VaR confidence level
-    'atr_sl_mult': 4.20043,                 # ETH-tuned: 3.5×ATR ≈ $49-56 from entry. ETH's calmer candles need tighter stops than SOL
-    'max_position_pct': 0.583787,           # Was 0.376 — headroom for 5 grid levels (5% × 5 levels × 3× leverage = 75% notional, cap at 50%)
+    'atr_sl_mult': 3.13,                 # ETH-tuned: 3.5×ATR ≈ $49-56 from entry. ETH's calmer candles need tighter stops than SOL
+    'max_position_pct': 0.600191,           # Was 0.376 — headroom for 5 grid levels (5% × 5 levels × 3× leverage = 75% notional, cap at 50%)
 
     # ─── Funding Rate ─────────────────────────────────────────
     'funding_threshold': 0.0003,    # 0.03% adverse funding trigger
@@ -69,15 +69,15 @@ STRATEGY_PARAMS = {
     'fee_maker': 0.0002,            # 0.02% maker fee (Binance actual)
     'fee_taker': 0.0005,            # 0.05% taker fee (Binance actual)
     'slippage': 0.0005,             # 0.05% per side
-    'leverage': 4.0,                # 2x leverage (reduced from 3x — less stop-loss dollar impact)
+    'leverage': 6.0,                # 2x leverage (reduced from 3x — less stop-loss dollar impact)
     'allow_short': True,            # Enable short grid
 
     # ─── Risk De-scaling (new) ────────────────────────────────
-    'stop_cooldown_bars': 82,       # Bars de-scale lasts after consecutive stops (12h on 15m)
+    'stop_cooldown_bars': 85,       # Bars de-scale lasts after consecutive stops (12h on 15m)
     'stop_cooldown_thresh': 2,      # # of stops within window that triggers de-scale
-    'low_volume_threshold': 0.53587,    # Volume < 50% of 7d SMA = low-liquidity period
-    'funding_harvest_threshold': 0.00020853,  # Funding rate above this triggers sizing tilt
-    'kelly_window': 37,             # Rolling trades window for Quarter-Kelly sizing
+    'low_volume_threshold': 0.439733,    # Volume < 50% of 7d SMA = low-liquidity period
+    'funding_harvest_threshold': 0.000369016,  # Funding rate above this triggers sizing tilt
+    'kelly_window': 48,             # Rolling trades window for Quarter-Kelly sizing
 }
 
 # ─── Live Trading Configuration ─────────────────────────────────
