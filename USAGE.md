@@ -836,6 +836,37 @@ OPTIMIZER_SPACE = {
 
 To remove a parameter from optimization, comment out its entry.
 
+### Tuning Guide: How the Knobs Work
+
+The behavior of GridStrategyV4 is heavily customizable. If the bot is doing something you don't like, adjusting the right knob in `config.py` will fix it.
+
+#### 1. "The bot trades too rarely / The grid is too wide"
+If you find the bot is sitting idle for hours without getting fills:
+*   **Decrease `grid_spacing_k`** (e.g., `1.5` → `0.8`). This tightens the grid around the current price. 
+*   **Decrease `spacing_floor`** (e.g., `0.005` → `0.002`). In ultra-low volatility, the floor prevents the grid from getting too tight. Lowering it allows tighter grids.
+*   **Decrease `regen_drift_mult`** (e.g., `1.5` → `1.15`). A lower threshold means the bot will regenerate the grid more frequently as price moves, keeping orders close to the action.
+
+#### 2. "The bot is bleeding capital in choppy/sideways markets"
+If you are seeing consecutive stop-outs in high-volatility sideways action:
+*   **Increase `grid_spacing_k`**. A wider grid absorbs volatility without triggering stops.
+*   **Increase `stop_cooldown_bars`**. The bot will scale down its order size for longer after taking losses, protecting capital while the market chops.
+*   **Increase `adx_trend_threshold`** (e.g., `25.0` → `32.0`). This forces the bot to demand stronger momentum before treating a move as a "real" trend.
+
+#### 3. "The bot accumulates too much inventory on one side"
+If the bot keeps buying into a downtrend and locking up all your capital:
+*   **Increase `gamma`** (e.g., `1.0` → `2.0`). This parameter controls *Risk Aversion* in the Avellaneda-Stoikov model. Higher gamma means the grid will aggressively skew away from the side where you hold heavy inventory.
+*   **Decrease `max_inventory_per_side`** (e.g., `5` → `3`). Places a hard cap on how many fills can be held simultaneously.
+*   **Decrease `offset_prune_ratio`** (e.g., `4.0` → `1.5`). The Pruning engine will aggressively use your daily realized profits to subsidize closing out underwater toxic fills.
+
+#### 4. "Stops are triggering on wicks and then price recovers!"
+*   **Increase `atr_sl_mult`** (e.g., `3.0` → `4.5`). Widen the stop threshold to absorb deeper wicks.
+*   *(Note: V4.2 inherently protects against this via Candle-Close Stage 1 stops, but extreme volatility may still hit the Stage 2 wick threshold).*
+
+#### 5. "I want the bot to be more aggressive / use more capital"
+*   **Increase `order_pct`** (e.g., `0.05` → `0.10`). Base position sizing parameter.
+*   **Increase `max_position_pct`** (e.g., `0.5` → `0.8`). Raises the notional cap per side.
+*   **Decrease `kelly_window`** (e.g., `50` → `20`). The Quarter-Kelly sizing logic will react more quickly to short-term winning streaks and increase size faster.
+
 ---
 
 ## Data Management

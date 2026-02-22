@@ -38,30 +38,9 @@ def fetch_historical_funding(exchange, symbol: str, start_ts: int, end_ts: int, 
             
     return all_funding
 
-def fetch_data(symbol='BTC/USDT', timeframe='15m', start_date='2023-01-01', end_date=None, limit=1000, exchange_id='binance'):
-    """
-    Fetch OHLCV data from CCXT with local Parquet caching.
-    """
-    safe_symbol = symbol.replace('/', '')
-    cache_dir = os.path.join('data', 'cache')
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    start_ts = int(pd.Timestamp(start_date).timestamp() * 1000)
-    end_ts = int(pd.Timestamp(end_date).timestamp() * 1000) if end_date else int(time.time() * 1000)
-    
-    filename = f"{safe_symbol}_{timeframe}_{start_ts}_{end_ts}.parquet"
-    filepath = os.path.join(cache_dir, filename)
-    
-    # Check cache
-    if os.path.exists(filepath):
-        print(f"📦 Loading cached data for {symbol}...")
-        return pd.read_parquet(filepath)
-    
-    print(f"📥 Fetching {symbol} from {exchange_id}...")
-    
-    exchange_class = getattr(ccxt, exchange_id)
-    exchange = exchange_class({'enableRateLimit': True})
-    
+def _fetch_ohlcv_and_funding(exchange, symbol, timeframe, start_ts, end_ts, limit=1000):
+    """Helper to fetch OHLCV and funding for a specific timestamp range and merge them."""
+    print(f"📥 Fetching {symbol} from {start_ts} to {end_ts}...")
     all_ohlcv = []
     since = start_ts
     
@@ -86,6 +65,9 @@ def fetch_data(symbol='BTC/USDT', timeframe='15m', start_date='2023-01-01', end_
             time.sleep(5)
             continue
             
+    if not all_ohlcv:
+        return pd.DataFrame()
+        
     df_ohlcv = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_ohlcv = df_ohlcv[df_ohlcv['timestamp'] <= end_ts] # Trim content after end date
     
@@ -103,12 +85,10 @@ def fetch_data(symbol='BTC/USDT', timeframe='15m', start_date='2023-01-01', end_
             df_funding = df_funding.sort_values('timestamp').drop_duplicates('timestamp')
             
             # Use merge_asof to forward-fill funding rates into the 15m OHLCV timeline
-            # 'backward' direction means for a 08:15 candle, find the closest funding timestamp <= 08:15.
             df_ohlcv = df_ohlcv.sort_values('timestamp')
             df = pd.merge_asof(df_ohlcv, df_funding, on='timestamp', direction='backward')
             
-            # Fill any NaN at the very beginning with the first known funding rate, or 0
-            # A typical funding rate is 0.01% (0.0001) per 8h
+            # Fill any NaN at the very beginning with the first known funding rate, or 0.0001
             df['fundingRate'] = df['fundingRate'].bfill().fillna(0.0001)
         else:
             df = df_ohlcv
@@ -117,8 +97,74 @@ def fetch_data(symbol='BTC/USDT', timeframe='15m', start_date='2023-01-01', end_
         df = df_ohlcv
         df['fundingRate'] = 0.0001
         
-    # Save cache
-    df.to_parquet(filepath)
-    print(f"\n✅ Data saved to {filepath}")
+    return df
+
+def fetch_data(symbol='BTC/USDT', timeframe='15m', start_date='2023-01-01', end_date=None, limit=1000, exchange_id='binance'):
+    """
+    Fetch OHLCV data from CCXT with local Parquet caching.
+    Merges data into a single file per symbol/timeframe to avoid downloading existing data.
+    """
+    safe_symbol = symbol.replace('/', '')
+    cache_dir = os.path.join('data', 'cache')
+    os.makedirs(cache_dir, exist_ok=True)
     
+    start_ts = int(pd.Timestamp(start_date).timestamp() * 1000)
+    end_ts = int(pd.Timestamp(end_date).timestamp() * 1000) if end_date else int(time.time() * 1000)
+    
+    filename = f"{safe_symbol}_{timeframe}.parquet"
+    filepath = os.path.join(cache_dir, filename)
+    
+    exchange_class = getattr(ccxt, exchange_id)
+    exchange = exchange_class({'enableRateLimit': True})
+    
+    df_existing = pd.DataFrame()
+    
+    # Load existing cache if available
+    if os.path.exists(filepath):
+        print(f"📦 Loading cached data for {symbol} ({filename})...")
+        df_existing = pd.read_parquet(filepath)
+        df_existing = df_existing.sort_values('timestamp').drop_duplicates('timestamp')
+        
+    if not df_existing.empty:
+        cache_start_ts = int(df_existing['timestamp'].iloc[0])
+        cache_end_ts = int(df_existing['timestamp'].iloc[-1])
+        
+        dfs_to_concat = [df_existing]
+        needs_save = False
+        
+        # Check if we need data before the cache starts
+        if start_ts < cache_start_ts:
+            print(f"🔄 Need earlier data (from {datetime.fromtimestamp(start_ts/1000)} to {datetime.fromtimestamp(cache_start_ts/1000)})")
+            df_before = _fetch_ohlcv_and_funding(exchange, symbol, timeframe, start_ts, cache_start_ts, limit)
+            if not df_before.empty:
+                dfs_to_concat.insert(0, df_before)
+                needs_save = True
+                
+        # Check if we need data after the cache ends
+        if end_ts > cache_end_ts:
+            print(f"🔄 Need newer data (from {datetime.fromtimestamp(cache_end_ts/1000)} to {datetime.fromtimestamp(end_ts/1000)})")
+            df_after = _fetch_ohlcv_and_funding(exchange, symbol, timeframe, cache_end_ts + 1, end_ts, limit)
+            if not df_after.empty:
+                dfs_to_concat.append(df_after)
+                needs_save = True
+                
+        if needs_save:
+            df = pd.concat(dfs_to_concat, ignore_index=True)
+            df = df.sort_values('timestamp').drop_duplicates('timestamp')
+            df.to_parquet(filepath)
+            print(f"\n✅ Merged and saved updated data to {filepath}")
+        else:
+            df = df_existing
+            print(f"✅ Requested data range is fully within existing cache.")
+    else:
+        # No cache exists, fetch everything requested
+        df = _fetch_ohlcv_and_funding(exchange, symbol, timeframe, start_ts, end_ts, limit)
+        if not df.empty:
+            df.to_parquet(filepath)
+            print(f"\n✅ Data saved to {filepath}")
+        
+    # Finally, return only the requested slice
+    if not df.empty:
+        df = df[(df['timestamp'] >= start_ts) & (df['timestamp'] <= end_ts)].reset_index(drop=True)
+        
     return df

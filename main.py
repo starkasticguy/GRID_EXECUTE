@@ -798,6 +798,30 @@ def main():
     print(f"  Capital: ${config['initial_capital']:,.0f} | "
           f"Leverage: {config['leverage']}x | "
           f"Short: {'ON' if config['allow_short'] else 'OFF'}")
+          
+    # Calculate worst-case margin requirements
+    cap = config['initial_capital']
+    lev = config['leverage']
+    order_pct = config.get('order_pct', 0.05)
+    max_inv = config.get('max_inventory_per_side', 10)
+    max_pos = config.get('max_position_pct', 0.7)
+    
+    # The notional value of 1 grid fill is (cap * order_pct * lev)
+    # The grid will place up to max_inv fills per side, but is hard-capped by (max_pos * cap)
+    grid_notional = max_inv * order_pct * lev * cap
+    capped_notional = min(grid_notional, max_pos * cap)
+    
+    sides = 2 if config.get('allow_short', True) else 1
+    total_notional = capped_notional * sides
+    req_margin = total_notional / lev if lev > 0 else total_notional
+    
+    print(f"  Max Margin Required: ${req_margin:,.2f} "
+          f"({req_margin/cap*100:.1f}% of Capital)")
+    
+    if req_margin > cap * 0.95:
+        print(f"  ⚠️ WARNING: Insufficient capital for worst-case margin!")
+        print(f"     You will likely get liquidated. Need at least ${req_margin * 1.1:,.0f} capital.")
+
     print(f"  Coins: {coins} | Period: {start} -> {end or 'now'}")
     print(f"{'='*62}")
 

@@ -1,458 +1,89 @@
-# CLAUDE.md — Agent Context for GridStrategyV4
+# GridStrategyV4 Architecture & Replication Guide
 
-## Project Overview
+You are Claude. The user wants you to completely rebuild "GridStrategyV4", a highly advanced, cryptocurrency-native, hedge-mode grid trading system. This document contains the full specification, mathematical models, and architectural blueprints required to replicate the engine from scratch.
 
-**GridStrategyV4: Volatility-Adaptive Long/Short Grid Trading Engine for Crypto Perpetual Futures**
+## Core Philosophy
+This is not a toy grid bot. It is designed for 15-minute crypto perpetual futures. It uses an Unsupervised Machine Learning (GMM) or Kaufman Adaptive Moving Average (KAMA) regime filter to turn the grid on/off, an Avellaneda-Stoikov (A-S) market-making model to skew the grid away from toxic inventory, and a 5-method pruning system to surgically cut losing trades.
 
-A hedge-mode grid trading system on 15-minute candles that dynamically adapts to market regime via KAMA-based detection. Solves the three classic grid failures:
+## Directory Structure
+```text
+core/
+  kama.py       # ER, KAMA, and Regime FSM
+  atr.py        # Wilder's ATR, Z-Score (circuit breaker), Rolling Volatility (for A-S model)
+  adx.py        # Wilder's ADX (to veto weak trends)
+  grid.py       # Geometric grid math, round-number avoidance
+  inventory.py  # Avellaneda-Stoikov reservation price and optimal spread
+  risk.py       # Binance tiered margin, iterative liquidation solver, VaR
+  funding.py    # Synthetic funding rates, funding-aware sizing
+  kelly.py      # Quarter-Kelly dynamically sized bets
 
-| Problem | V4 Solution | Result |
-|---|---|---|
-| Uptrends (grids miss moves) | Trailing Up shifts grid upward | Captures 80-90% of trend |
-| Downtrends (toxic inventory) | Avellaneda-Stoikov Inventory Skew | Drawdown reduced -40% to -25% |
-| Black Swans (cascade losses) | Z-Score Circuit Breaker + Pruning | Capital preserved through crashes |
+engine/
+  types.py      # PositionTracker (tracks independent fills), Trade labels
+  matching.py   # Virtual OrderBook, Conservative Fill Model (Low<=P for buys)
+  pruning.py    # 5-Method Gardener (Deviance, Oldest, Gap, Funding, Offset)
+  strategy.py   # GridStrategyV4 (The 11-step orchestrator loop)
 
-### Design Targets
-
-- **Hedge Mode**: Independent long + short positions (no netting)
-- **Perpetual Futures**: Funding rate simulation, tiered margin, iterative liquidation
-- **15-Minute Timeframe**: 96 candles/day; filters microstructure noise, stays responsive
-- **Bias-Free Backtest**: Bar i uses indicators from bar i-1, price action from bar i
-- **Anti-Overfit Optimizer**: Walk-forward validation, multi-coin averaging, stability penalty
-
----
-
-## Status
-
-**Version**: V4.2 — Crypto-Native Hardening
-**Status**: Complete (Backtest + Live Execution)
-**Tests**: 130/130 passing (all suites)
-**Architecture**: Pure Python/NumPy (Numba-ready structure for future acceleration)
-
----
-
-## Quick Start
-
-```bash
-# Install
-pip install -r requirements.txt
-
-# Backtest (default: BTC, ETH, SOL from 2024-01-01)
-python3 main.py --coins BTC ETH SOL --start 2024-01-01
-
-# Long-only mode
-python3 main.py --coins BTC --no-short --capital 5000
-
-# Live trading (dry-run first)
-python3 live_trade.py --coin BTC --dry-run
-
-# Live trading (real)
-python3 live_trade.py --coin BTC --capital 5000 --leverage 10
-
-# Optimize
-python3 optimizer.py --coins BTC SOL --trials 200 --windows 3
-
-# Tests
-python3 -m pytest tests/ -v
+live/
+  executor.py   # ccxt Binance wrapper (hedge mode, retries, rate limits)
+  runner.py     # Live version of the 11-step loop parsing real-time 15m candles
+  state.py      # Atomic JSON persistence for crash recovery
+  logger.py     # PnL/Trade CSV and JSONL logging
+  monitor.py    # Equity drawdown alerts and exchange sync
 ```
 
----
-
-## File Structure
-
-```
-GRID_Trade/
-├── CLAUDE.md                    # This file (agent context)
-├── README.md                    # Full math + logic documentation
-├── USAGE.md                     # Complete usage guide
-├── config.py                    # All V4 parameters + optimizer space + LIVE_CONFIG
-├── main.py                      # CLI entry point (backtest runner)
-├── live_trade.py                # CLI entry point (live trading)
-├── optimizer.py                 # Walk-forward Optuna optimizer
-├── apply_optimized_params.py    # Apply optimizer output to config.py
-├── requirements.txt             # Dependencies (ccxt, pandas, numpy, optuna, etc.)
-│
-├── core/                        # Math / indicator modules
-│   ├── __init__.py
-│   ├── kama.py                  # KAMA, ER, 5-state Regime FSM
-│   ├── atr.py                   # ATR (Wilder's), Z-Score, Rolling Volatility
-│   ├── adx.py                   # ADX (Average Directional Index) — veto filter [NEW]
-│   ├── grid.py                  # Grid level generation, geometric spacing, round-number avoidance
-│   ├── inventory.py             # Full Avellaneda-Stoikov model
-│   ├── risk.py                  # Tiered margin, liquidation, VaR, portfolio correlation VaR
-│   ├── funding.py               # Synthetic funding rate + funding-aware order sizing
-│   └── kelly.py                 # Quarter-Kelly regime-filtered position sizing [NEW]
-│
-├── engine/                      # Execution logic
-│   ├── __init__.py
-│   ├── types.py                 # PositionTracker, order types, trade labels
-│   ├── matching.py              # Virtual OrderBook, conservative fill model
-│   ├── pruning.py               # 5-method "Gardener" pruning module
-│   └── strategy.py              # GridStrategyV4 main orchestrator (~650 lines)
-│
-├── live/                        # Live execution module
-│   ├── __init__.py
-│   ├── executor.py              # BinanceExecutor: ccxt wrapper for Futures hedge mode
-│   ├── runner.py                # LiveRunner: 11-step strategy loop on real candles
-│   ├── state.py                 # StateManager: JSON persistence + crash recovery
-│   ├── logger.py                # TradeLogger: structured logging + per-trade metrics
-│   └── monitor.py               # HealthMonitor: heartbeat, sync, equity checks
-│
-├── backtest/                    # Backtesting infrastructure
-│   ├── __init__.py
-│   ├── simulator.py             # BacktestSimulator wrapper (single/multi-coin)
-│   └── data_fetcher.py          # Binance OHLCV via ccxt + parquet caching
-│
-├── tests/                       # Test suite (121 tests)
-│   ├── __init__.py
-│   ├── test_indicators.py       # KAMA, ER, ATR, Z-Score, regime, volatility (15 tests)
-│   ├── test_strategy.py         # Full backtest, hedge mode, CB, lookahead-free (12 tests)
-│   ├── test_risk.py             # Margin tiers, liquidation, VaR, PnL (16 tests)
-│   ├── test_pruning.py          # All 5 pruning methods + priority order (14 tests)
-│   └── test_live.py             # Live module: executor, state, logger, monitor (31 tests)
-│
-└── data/                        # Runtime data (gitignored)
-    ├── cache/                   # Parquet-cached OHLCV data
-    ├── output/                  # CSV trade exports
-    ├── charts/                  # PNG equity curves + trade maps
-    ├── live_state/              # Live runner state persistence
-    └── live_logs/               # Live trade logs + rotating log files
-```
-
----
-
-## Core Concepts
-
-### 1. KAMA (Kaufman Adaptive Moving Average)
-
-**File**: `core/kama.py`
-
-Adapts smoothing speed based on market efficiency:
-
-```
-ER = |P_t - P_{t-n}| / Sum(|P_i - P_{i-1}|)    # Efficiency Ratio
-SC = (ER * (SC_fast - SC_slow) + SC_slow)^2       # Smoothing Constant
-KAMA_t = KAMA_{t-1} + SC * (P_t - KAMA_{t-1})    # Recursive update
-```
-
-- ER near 1.0 = trending (fast KAMA response)
-- ER near 0.0 = choppy (slow KAMA response)
-- SC is squared to suppress noise and amplify trend
-
-### 2. Five-State Regime FSM
-
-**File**: `core/kama.py` function `detect_regime()`
-
-Normalized KAMA slope: `slope = (KAMA_t - KAMA_{t-1}) / ATR`
-
-| Regime | Code | Condition | Grid Behavior |
-|---|---|---|---|
-| NOISE | 0 | `\|slope\| < theta` OR `ER < 0.5` | Both long + short grids active |
-| UPTREND | 1 | `slope > theta` AND `ER > 0.5` | Long grid active, no new shorts |
-| DOWNTREND | -1 | `slope < -theta` AND `ER > 0.5` | Short grid active, no new longs |
-| BREAKOUT_UP | 2 | `slope > 2 * theta` | Long grid + trailing up |
-| BREAKOUT_DOWN | -2 | `slope < -2 * theta` | Short grid, halt long entries |
-
-### 3. Avellaneda-Stoikov Inventory Model
-
-**File**: `core/inventory.py`
-
-```
-Reservation Price:  r = s - q * gamma * sigma^2 * T
-Optimal Spread:     delta = gamma * sigma^2 * T + (2/gamma) * ln(1 + gamma/kappa)
-```
-
-- Grid centers on `r` (not mid-price `s`)
-- Long inventory (q > 0) shifts `r` below `s` = sells closer, buys further
-- Short inventory (q < 0) shifts `r` above `s` = buys closer, sells further
-- `gamma` = risk aversion (0.1-2.0), `kappa` = fill probability, `sigma` = rolling volatility
-- `T` = time horizon in 15m bars (default **96** = 1 day). T=1.0 produces ~$0.01 skew on ETH; T=96 produces ~$2 — the model is now meaningfully active.
-
-### 4. Circuit Breaker
-
-**File**: `core/atr.py` (Z-Score), `engine/strategy.py` (logic)
-
-```
-Z = (Close - SMA_20) / ATR
-Z < -3.0  ->  HALT (cancel all opening orders, hold positions)
-Z > -1.0  ->  RESUME (regenerate grid)
-```
-
-### 5. Five-Method Pruning ("Gardener")
-
-**File**: `engine/pruning.py`
-
-Priority order (most urgent first):
-
-| # | Method | Trigger | Target |
-|---|---|---|---|
-| 1 | Deviance | Price > 3-sigma from KAMA | Worst fill (highest entry for longs) |
-| 2 | Oldest | Fill held > 24 hours | Oldest fill |
-| 3 | Gap | Fill > 3x grid spacing from price | Most distant fill |
-| 4 | Funding | Accumulated funding > 50% of grid profit | Highest funding cost fill |
-| 5 | Profit Offset | Profit buffer available | Worst underwater fill |
-
-### 6. Trailing Up
-
-**File**: `engine/strategy.py`
-
-In UPTREND/BREAKOUT_UP when ER > threshold:
-- If price exceeds top grid level, shift anchor upward by 50% of gap
-- Regenerate grid at new higher levels
-- Prevents grid from being "left behind" in trends
-
-### 7. Hedge Mode
-
-**File**: `engine/types.py` (`PositionTracker` class)
-
-Two independent position trackers:
-- `pos_long`: Buys = entries, Sells = take-profits
-- `pos_short`: Sells = entries, Buys = take-profits
-- No netting: opening a long does NOT close a short
-- Each has own avg_entry, fills list, PnL tracking
-- Fills list enables targeted pruning of specific fills
-
-### 8. Risk Management
-
-**File**: `core/risk.py`
-
-- **Tiered Margin**: 7-tier Binance USDM specification (0.4% to 12.5% MMR)
-- **Iterative Liquidation**: Converges in ~3-5 iterations (MMR depends on P_liq)
-- **VaR Constraint**: `VaR_95 = Portfolio * 1.65 * sigma_15m` blocks new orders if > max_drawdown * equity
-- **ATR Stop Loss (2-stage)**: Stage 1 closes 50% at `entry ± sl_mult × ATR` (multi-fill); Stage 2 closes remainder at `1.5×` multiplier. Single-fill positions close 100% immediately.
-
----
-
-## Main Loop Order (engine/strategy.py)
-
-```
-for each bar i (starting from 1):
-    1. REGIME        - Read from pre-computed indicators[i-1] (no lookahead)
-                       ADX veto: if ADX < 25, TREND overridden to NOISE
-    2. CIRCUIT BREAK  - Halt if Z < -3, resume if Z > -1
-    3. STOP LOSS      - 2-stage ATR stops: Stage 1 fires on candle CLOSE (anti-wick)
-                       Stage 2 uses wick as safety net. Cooldown tracks consecutive stops.
-    4. LIQUIDATION     - Check if leveraged positions hit liquidation price
-    5. PRUNING         - Run 5-method cycle on both sides
-                       + VaR pre-emptive: force-prune worst loser at 75% drawdown cap
-    6. TRAILING UP     - Shift grid anchor upward in uptrends
-    7. VaR CHECK       - Block new orders if VaR exceeds limit
-    8. GRID GENERATE   - Quarter-Kelly + de-scaling multiplier applied to order_pct
-                         Weekend/low-vol de-scaling on max_position_pct
-                         Geometric grid levels with round-number avoidance
-                         Funding-aware order sizing tilt in NOISE regime
-    9. FILL MATCHING   - Conservative: Buy if Low <= Price, Sell if High >= Price
-   10. FUNDING RATE    - Apply every 32 bars (8h intervals)
-   11. LOG EQUITY      - Wallet + unrealized PnL both sides
-```
-
----
-
-## Key Parameters (config.py)
-
-```python
-# Regime Detection (KAMA/ER + ADX Veto)
-'kama_period': 10           # ER lookback (150 min)
-'regime_threshold': 0.15    # KAMA slope theta
-'er_trend_threshold': 0.5   # ER above = trend
-'adx_period': 14            # ADX lookback (Wilder's)
-'adx_trend_threshold': 25.0 # Below = force NOISE (fakeout defense)
-
-# Grid
-'grid_spacing_k': 1.0       # spacing = k * ATR
-'grid_levels': 10            # Levels per side
-'order_pct': 0.05            # 5% capital per fill (Quarter-Kelly scales this down)
-'spacing_floor': 0.005       # Min 0.5% of price
-'grid_mode': 'geometric'     # 'geometric' (pct-spaced, round-num avoidance) or 'arithmetic'
-
-# Inventory (Avellaneda-Stoikov)
-'gamma': 0.5                 # Risk aversion
-'kappa': 1.5                 # Fill probability
-'as_time_horizon': 96.0      # T in 15m bars (96 = 1 day); controls inventory skew magnitude
-
-# Trailing Up
-'trailing_activation_er': 0.65
-'trailing_reserve_pct': 0.25
-
-# Circuit Breaker
-'halt_z_threshold': -3.0     # 3-sigma crash halt
-'resume_z_threshold': -1.0
-
-# Pruning
-'deviance_sigma': 3.0        # Deviance threshold (ATR mult)
-'max_position_age_hours': 24  # Oldest fill pruning
-'gap_prune_mult': 3.0        # Gap threshold (grid spacing mult)
-'funding_cost_ratio': 0.5    # Funding vs profit threshold
-
-# Risk
-'max_drawdown_pct': 0.15     # VaR hard cap (15%)
-'atr_sl_mult': 3.5           # Stop loss (ATR mult)
-'max_position_pct': 0.7      # Max notional per side
-
-# Crypto-Native Risk De-scaling
-'stop_cooldown_bars': 48     # 12h de-scale after consecutive stops
-'stop_cooldown_thresh': 2    # Stops to trigger cooldown
-'low_volume_threshold': 0.5  # Below 50% of 7d avg = low liquidity → reduce exposure
-'funding_harvest_threshold': 0.0002  # Funding rate tilt threshold in NOISE regime
-'kelly_window': 50           # Rolling trades for Quarter-Kelly sizing
-
-# Execution
-'fee_maker': -0.00005        # -0.005% maker rebate
-'fee_taker': 0.0002          # 0.02% taker fee
-'leverage': 5.0              # 5x leverage
-'allow_short': True          # Hedge mode on/off
-```
-
----
-
-## Trade Labels
-
-```
-BUY_OPEN_LONG         # Grid buy entry (long)
-SELL_CLOSE_LONG       # Grid sell take-profit (long)
-SELL_OPEN_SHORT       # Grid sell entry (short)
-BUY_CLOSE_SHORT       # Grid buy take-profit (short)
-STOP_LONG             # ATR stop loss (long)
-STOP_SHORT            # ATR stop loss (short)
-PRUNE_DEVIANCE        # Pruning: price deviated from KAMA
-PRUNE_OLDEST          # Pruning: fill too old
-PRUNE_GAP             # Pruning: price-fill gap too large
-PRUNE_FUNDING         # Pruning: funding cost too high
-PRUNE_OFFSET          # Pruning: profit-subsidized close
-PRUNE_VAR_WARNING     # Pruning: pre-emptive de-leverage at 75% drawdown cap
-CIRCUIT_BREAKER_HALT  # Trading halted (Z < -3)
-LIQUIDATION           # Margin liquidation
-```
-
----
-
-## Metrics Output
-
-**Performance**: `total_return_pct`, `buy_hold_return_pct`, `max_drawdown_pct`, `sharpe_ratio`, `sortino_ratio`, `calmar_ratio`
-
-**Trading**: `longs_opened`, `longs_closed`, `shorts_opened`, `shorts_closed`, `stops_long`, `stops_short`, `total_trades`
-
-**Risk Events**: `prune_count`, `prune_types` (breakdown), `circuit_breaker_triggers`, `trailing_shifts`, `var_blocks`, `liquidations`
-
-**P&L**: `win_rate_pct`, `profit_factor`, `gross_profit`, `gross_loss`, `funding_pnl`, `final_capital`
-
-Annualization factor for 15m data: `sqrt(96 * 365)` = ~187.1
-
----
-
-## Lookahead-Free Backtesting
-
-```python
-for i in range(1, n):
-    prev = indicators[i-1]    # Decisions use prev-bar KAMA, ATR, ER, Z, regime
-    curr = ohlc[i]            # Fills use current-bar Open, High, Low, Close
-```
-
-Verified by `test_no_future_data_access`: runs identical first-200 bars on 200-bar and 300-bar DataFrames, asserts equity curves match.
-
----
-
-## Anti-Overfit Optimizer (optimizer.py)
-
-1. **Walk-Forward Validation**: Train on 70%, test on 30%, sliding windows
-2. **Multi-Coin Averaging**: Parameters must work across BTC, ETH, SOL
-3. **Calmar Ratio Fitness**: Return / Max Drawdown (penalizes drawdown-heavy results)
-4. **Complexity Penalty**: Trades > 500 penalized (over-trading signal)
-5. **Stability Penalty**: High variance across windows reduces score
-6. **OOS Validation**: Final best params tested on held-out 30%
-
----
-
-## Realistic Expectations
-
-- **Sideways/NOISE**: Grid thrives - primary profit source
-- **Uptrends**: Trailing Up captures trend (80-90% vs 20-30% static)
-- **Downtrends**: Inventory Skew + Pruning + CB reduce drawdown but no long-only strategy profits in monotonic downtrends
-- **Black Swans**: Circuit Breaker preserves capital, avoids "selling the bottom"
-- **Goal in downtrends**: Capital preservation for trading the recovery
-
----
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `KeyError: 'kama'` | Indicators are pre-computed in `prepare_indicators()` - ensure DataFrame has OHLCV columns |
-| Trailing Up never activates | Lower `trailing_activation_er` or use stronger trend data |
-| Circuit Breaker triggers too often | Widen `halt_z_threshold` (e.g., -3.0 to -4.0) |
-| Strategy loses in sideways | Decrease `spacing_mult`, increase `grid_levels` |
-| Pruning too aggressive | Increase `prune_depth_mult` or `max_position_age_hours` |
-| No shorts being opened | Check `allow_short: True` and regime is not stuck in UPTREND |
-
----
-
-## Dependencies
-
-```
-ccxt        # Exchange data fetching + live order placement
-pandas      # DataFrames
-numpy       # Numerical computation
-optuna      # Bayesian optimization
-matplotlib  # Chart generation
-pyarrow     # Parquet caching
-pytest      # Test suite
-python-dotenv  # Environment variable management (live trading)
-```
-
----
-
-## Live Execution Module
-
-### Architecture
-
-The `live/` module mirrors the backtest's 11-step strategy loop on real 15m candles. All `core/` indicator functions and `engine/types.py` (PositionTracker) are used without modification — only the order placement and fill detection layers change.
-
-### Key Classes
-
-| Class | File | Purpose |
-|-------|------|---------|
-| `BinanceExecutor` | `live/executor.py` | Exchange API via ccxt (orders, positions, balance, funding) |
-| `LiveRunner` | `live/runner.py` | Main 11-step orchestration loop on real candles |
-| `StateManager` | `live/state.py` | JSON persistence + CSV/JSONL trade logs + crash recovery |
-| `TradeLogger` | `live/logger.py` | Structured logging + per-trade metrics (PnL, R-multiple, hold time) |
-| `HealthMonitor` | `live/monitor.py` | Heartbeat, position sync, equity checks, error tracking |
-
-### Backtest → Live Mapping
-
-| Step | Backtest | Live |
-|------|----------|------|
-| Regime | `indicators[i-1]` | `indicators.iloc[-2]` (rolling buffer) |
-| Circuit Break | Set `halted=True` | Same + `cancel_all_orders()` |
-| Stop Loss | Check candle H/L | Same + market order via executor |
-| Pruning | `close_specific_fill()` | Same + market order for fill qty |
-| Grid Generate | Virtual OrderBook | Real limit orders on exchange |
-| Fill Matching | `check_fills(H,L)` | Exchange order polling (pre-step sync) |
-| Funding Rate | Synthetic simulation | Real `get_funding_rate()` from exchange |
-
-### Config
-
-Live-specific config is in `LIVE_CONFIG` dict in `config.py`. Strategy parameters from `STRATEGY_PARAMS` are shared with the backtest.
-
-### API Keys
-
-Read from environment variables `BINANCE_API_KEY` and `BINANCE_API_SECRET`.
-
----
-
-## Future Work
-
-1. Numba acceleration (`@njit` on hot loops)
-2. WebSocket feed for real-time candle streaming (replace polling)
-3. Multi-timeframe signals (1h regime, 15m execution)
-4. Genetic algorithm optimizer option
-5. Break-even analysis tool
-6. Multi-symbol concurrent live trading
-7. Telegram/Discord alert integration
-8. Live open-interest / liquidation-level monitoring (cascade awareness)
-9. Regime-conditional optimizer parameters (different `grid_spacing_k` per regime type)
-
----
-
-**Version**: V4.2
-**Date**: 2026-02-21
-**Status**: Complete (Backtest + Live Execution) — 130/130 tests passing
+## Layer 1: Signal Math (core/)
+
+1. **Efficiency Ratio (ER)**: `ER = abs(Close_t - Close_{t-n}) / Sum(abs(Close_i - Close_{i-1}))`
+2. **KAMA**: 
+   - `SC = (ER * (2/3 - 2/31) + 2/31)^2`
+   - `KAMA = prev_KAMA + SC * (Close - prev_KAMA)`
+3. **Regime FSM**: Normalized slope `(KAMA - prev_KAMA) / ATR`. 
+   - State Machine: NOISE (0), UPTREND (1), DOWNTREND (-1), BREAKOUT_UP (2), BREAKOUT_DOWN (-2). 
+   - *CRITICAL V4.2 ADDITION*: If ADX < 25, forcibly override UPTREND/DOWNTREND to NOISE (fakeout defense).
+4. **Circuit Breaker (Z-Score)**: `Z = (Close - SMA_20) / ATR`. Halt trading if Z < -3.0. Resume if Z > -1.0.
+
+## Layer 2: Grid & Inventory Math (core/)
+
+1. **Avellaneda-Stoikov Model**:
+   - `Normalized Inventory (q)`: `position_size / max_inventory` (clamped -1 to 1).
+   - `Reservation Price (r)`: `r = mid_price - q * gamma * sigma^2 * TimeHorizon`
+   - *Behavior*: If you hold Longs (q > 0), `r` drops below mid_price. You bid lower and ask lower to dump inventory.
+2. **Geometric Grid**:
+   - Spacing: `max(k * ATR, floor_pct * price)`.
+   - Levels are exponential: `anchor * (1 + spacing_pct)^level`.
+   - *Round-number defense*: Nudge levels 0.15% away from modulo-$1000/$100 price boundaries.
+3. **Quarter-Kelly Sizing**:
+   - `Kelly = (WinRate / AvgLoss) - ((1 - WinRate) / AvgWin)`
+   - Bet size multiplier: `Kelly * 0.25` (computed over last 50 closed trades in matching regime).
+
+## Layer 3: Execution & Engine (engine/ & live/)
+
+1. **Hedge Mode**: Longs and Shorts are fundamentally distinct objects (`PositionTracker`). A short fill does NOT close a long fill.
+2. **Fill Array**: A `PositionTracker` contains an array of `Fill` objects (qty, price, timestamp). We do not just track average entry. We track every single bullet fired so we can prune them individually.
+3. **The 11-Step Loop (Executed every 15m candle)**:
+   1. *Regime*: Read KAMA/ADX (from prev bar to prevent lookahead).
+   2. *Circuit Breaker*: Check Z-Score. Cancel orders if halted.
+   3. *Stop Loss*: 2-Stage ATR stop. Stage 1 (closes 50%) ONLY fires if the *candle closes* past the stop. Stage 2 (closes 100%) fires on the *wick*. Track consecutive stops; if >2 in 48 bars, halve order sizes (cooldown).
+   4. *Liquidation Check*: Margin call logic.
+   5. *Pruning*: Run the 5 methods. Also, if total unrealized drawdown > 75% of max VaR, force-close the worst single fill (Pre-emptive De-leverage).
+   6. *Trailing Up*: If Uptrend and price > top grid, shift anchor up 50% of the gap.
+   7. *VaR Check*: Stop new orders if `Portfolio * 1.65 * sigma > VaR_Limit`.
+   8. *Grid Generation*: Center A-S model, Kelly-size the orders, tilt sizing toward funding (receive side +25%, pay side -25%).
+   9. *Fill Matching*: Backtest (Low <= Price for buys) or Live (ccxt order polling).
+   10. *Funding*: Subtract funding costs every 8 hours.
+   11. *Log Equity*.
+
+## Layer 4: Pruning Systems (engine/pruning.py)
+Iterate through all open fills. First condition to trigger executes a market close for *that specific fill qty*.
+1. **Deviance**: Price is > 3 ATR away from KAMA.
+2. **Oldest**: Fill is > 24 hours old (stale capital).
+3. **Gap**: Price is > 3 grid spacings away from the fill.
+4. **Funding**: Accumulated funding cost for this fill > 50% of expected grid profit.
+5. **Offset**: We have enough realized profit today to subsidize closing our worst underwater fill at breakeven net-equity.
+
+## Live Trading Constraints
+- **Atomic State**: When saving `/data/live_state/state.json`, write to a `.tmp` file and `os.rename` to prevent corruption if the bot crashes mid-write.
+- **Min Notional**: Binance refuses orders < $5.0. Ensure the code dynamically calculates minimum quantity sizes based on the asset before sending orders.
+- **REST Polling**: Do not use websockets. Poll `fetch_open_orders()` to deduce fills, then sync positions.
+
+You are expected to write production-grade Python using `numpy` and `pandas`. Implement the formulas above strictly.

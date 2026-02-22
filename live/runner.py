@@ -796,17 +796,11 @@ class LiveRunner:
             self.trade_logger.log_trade(trade)
             self.state.save_trade(trade)
 
-        # Smart grid regen: only set flag if price drifted >1 spacing from
-        # anchor or regime changed.  Avoids cancel-and-replace churn that
-        # kills queue position on every fill.
-        if self._last_grid_spacing > 0:
-            anchor_drift_long = abs(fill_price - self.grid_anchor_long)
-            anchor_drift_short = abs(fill_price - self.grid_anchor_short)
-            if anchor_drift_long > self._last_grid_spacing or anchor_drift_short > self._last_grid_spacing:
-                self.grid_needs_regen = True
-        else:
-            # First run or spacing not yet computed — always regen
-            self.grid_needs_regen = True
+        # Always regenerate grid on any fill so that conditional orders
+        # (TPs and SLs) are placed immediately for the new/changed position.
+        # Without this, fills near the anchor would skip regen and leave
+        # positions unprotected (no TP/SL on exchange).
+        self.grid_needs_regen = True
 
     def _reconcile_positions(self, exchange_positions: dict):
         """Adjust internal tracker if exchange shows different position size."""
@@ -1664,8 +1658,8 @@ class LiveRunner:
         if short_orders > 0:
             self.trade_logger.log_grid_placement(
                 'SHORT', short_orders,
-                (float(buy_levels_s[-1]) if len(buy_levels_s) > 0 else price,
-                 float(sell_levels_s[-1]) if len(sell_levels_s) > 0 else price))
+                (float(sell_levels_s[-1]) if len(sell_levels_s) > 0 else price,
+                 float(buy_levels_s[-1]) if len(buy_levels_s) > 0 else price))
             if self.tg:
                 sell_range = (f"${float(sell_levels_s[0]):,.2f} – ${float(sell_levels_s[-1]):,.2f}"
                               if len(sell_levels_s) > 0 else 'none')

@@ -278,6 +278,33 @@ else:                              # Low efficiency
 
 ---
 
+### Gaussian Mixture Model (GMM) Classification
+
+**File**: `core/gmm.py`
+*(Note: Active when `use_ml_regime = True` in `config.py`)*
+
+The GMM is an unsupervised machine learning model that clusters raw market data into probabilistic states without hardcoded thresholds.
+
+**Input Features (per bar):**
+1. `Returns`: `ln(Close_t / Close_{t-1})`
+2. `Volatility`: Intrabar High/Low spread normalized by rolling ATR `(High_t - Low_t) / ATR_{t-14}`
+
+**Model Training & Inference:**
+The GMM attempts to fit three Gaussian distributions (clusters) to the feature space using Expectation-Maximization.
+```
+P(State = k | X) = (w_k * N(X | mu_k, Sigma_k)) / Sum(w_i * N(X | mu_i, Sigma_i))
+```
+
+**State Assignment:**
+The model produces three clusters. It then analyzes the `mu` (mean return) of each cluster to assign human-readable labels:
+1. **Bull Regime (1):** The cluster with the highest mean return.
+2. **Bear Regime (-1):** The cluster with the lowest mean return.
+3. **Noise Regime (0):** The middle cluster.
+
+Because this is a probabilistic model, the model emits the State with the highest posterior probability for the current bar. Like KAMA, the GMM output is subjected to the **ADX Veto Filter**.
+
+---
+
 ### Z-Score (Circuit Breaker Signal)
 
 **File**: `core/atr.py` | **Function**: `calculate_z_score()`

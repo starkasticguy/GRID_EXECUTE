@@ -157,7 +157,7 @@ OPTIMIZER_SPACE = {
     'stop_cooldown_bars':  {'type': 'int',   'low': 24,   'high': 96},    # Bars de-scale after stop-storm (6h–24h on 15m)
     'low_volume_threshold':{'type': 'float', 'low': 0.30, 'high': 0.70}, # Volume < X% of 7d avg = low liquidity
  #  'stop_cooldown_thresh':{'type': 'int',   'low': 2,    'high': 4},     # Stops to trigger de-scale (range too small; keep=2)
-
+    'leverage': {'type': 'float',  'low': 2.0,  'high': 100.0},
     # ─── Pruning ──────────────────────────────────────────────
     'deviance_sigma':   {'type': 'float', 'low': 2.5,  'high': 4.0},    # ETH-tuned: ETH is calmer, 3.0-3.5 is the sweet spot
     'gap_prune_mult':   {'type': 'float', 'low': 1.5,  'high': 4.0},    # Gap pruning threshold (tightened — aligns with narrower grid)
