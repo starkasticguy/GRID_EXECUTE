@@ -1265,8 +1265,7 @@ class LiveRunner:
                         self.metrics['prune_types'].get(LABEL_PRUNE_VAR_WARNING, 0) + 1
                     self.grid_needs_regen = True
                     logger.info(f"  [VaR]  Pruned worst {pos_side_str} fill "
-                                f"@{pos.fills[worst_idx]['price'] if worst_idx < len(pos.fills) else '?':.2f} "
-                                f"pnl={pnl:.2f}")
+                                f"@{fill_qty} pnl={pnl:.2f}")
                     self._log_trade_event(
                         cur_time, actual_p, fill_qty, LABEL_PRUNE_VAR_WARNING, prev_regime, pnl)
 
