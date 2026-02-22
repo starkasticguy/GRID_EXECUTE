@@ -42,6 +42,7 @@ from engine.types import (
     LABEL_CIRCUIT_BREAKER, LABEL_LIQUIDATION,
     LABEL_PRUNE_VAR_WARNING,
 )
+from core.ml_regime import classify_regimes_gmm
 from engine.pruning import run_pruning_cycle
 from live.executor import BinanceExecutor
 from live.state import StateManager
@@ -253,6 +254,8 @@ class LiveRunner:
         self._consecutive_stops = saved.get('_consecutive_stops', 0)
         self._descale_until_bar = saved.get('_descale_until_bar', 0)
         self._vol_history = saved.get('_vol_history', [])
+        self._partial_stop_fired_long = saved.get('_partial_stop_fired_long', False)
+        self._partial_stop_fired_short = saved.get('_partial_stop_fired_short', False)
 
         # Restore position fills
         for side_key, tracker in [('pos_long', self.pos_long),
@@ -580,9 +583,14 @@ class LiveRunner:
             adx_period = self.config.get('adx_period', 14)
             adx_threshold = self.config.get('adx_trend_threshold', 25.0)
             adx = calculate_adx(highs, lows, closes, adx_period)
-            raw_regime = detect_regime(kama, er, htf_atr,
-                                       self.config['regime_threshold'],
-                                       self.config['er_trend_threshold'])
+
+            # ─── Regime Detection (ML vs KAMA) ─────────────────────────
+            if self.config.get('use_ml_regime', False):
+                raw_regime = classify_regimes_gmm(closes, highs, lows, volumes)
+            else:
+                raw_regime = detect_regime(kama, er, htf_atr,
+                                           self.config['regime_threshold'],
+                                           self.config['er_trend_threshold'])
             # Apply ADX veto: if trend/breakout regime but ADX is weak → NOISE
             veto_regime = raw_regime.copy()
             for idx in range(len(veto_regime)):
@@ -795,6 +803,16 @@ class LiveRunner:
             }
             self.trade_logger.log_trade(trade)
             self.state.save_trade(trade)
+
+            # Update Kelly trade memory for dynamic sizing (#5)
+            if pnl != 0:
+                self._kelly_trades.append({
+                    'pnl': pnl,
+                    'regime': regime,
+                })
+                kelly_window = self.config.get('kelly_window', 50)
+                if len(self._kelly_trades) > kelly_window:
+                    self._kelly_trades = self._kelly_trades[-kelly_window:]
 
         # Always regenerate grid on any fill so that conditional orders
         # (TPs and SLs) are placed immediately for the new/changed position.
@@ -1783,6 +1801,8 @@ class LiveRunner:
             '_consecutive_stops': self._consecutive_stops,
             '_descale_until_bar': self._descale_until_bar,
             '_vol_history': self._vol_history,
+            '_partial_stop_fired_long': self._partial_stop_fired_long,
+            '_partial_stop_fired_short': self._partial_stop_fired_short,
         }
 
     # ─── Shutdown ────────────────────────────────────────────────
