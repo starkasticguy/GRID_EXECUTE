@@ -88,7 +88,10 @@ def split_rolling_walk_forward(df, n_windows=4, train_ratio=0.7):
         train_df = df.iloc[fold_start:train_end].reset_index(drop=True)
         test_df  = df.iloc[train_end:test_end].reset_index(drop=True)
 
-        if len(train_df) >= 200 and len(test_df) >= 50:
+        # 1001 bars minimum: ensures GMM (use_ml_regime) can train.
+        # GMM requires n > max(500, min(2880, n//2)); minimum n=1001 satisfies this.
+        # 200 bars was insufficient — GMM would silently return NOISE every bar.
+        if len(train_df) >= 1001 and len(test_df) >= 200:
             splits.append((train_df, test_df))
 
     return splits

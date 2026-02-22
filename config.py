@@ -19,7 +19,7 @@ STRATEGY_PARAMS = {
     'use_ml_regime': True,         # Use Gaussian Mixture Model for state classification instead of KAMA
 
     # ─── Grid ────────────────────────────────────────────────
-    'grid_spacing_k': 1.05,              # ETH-tuned: 1.6×ATR ≈ $24-26 spacing at $1500-3000. ETH's smoother candles fill TPs at this range
+    'grid_spacing_k': 1.1,              # ETH-tuned: 1.6×ATR ≈ $24-26 spacing at $1500-3000. ETH's smoother candles fill TPs at this range
     'grid_levels': 8,               # Levels per side (was 2 — one extra level for more grid cycles)
     'max_orders': 500,              # Max simultaneous orders
     'spacing_floor': 0.00450328,         # Min spacing (0.6% of price, was 0.5%)
@@ -162,7 +162,7 @@ OPTIMIZER_SPACE = {
     'stop_cooldown_bars':  {'type': 'int',   'low': 24,   'high': 96},    # Bars de-scale after stop-storm (6h–24h on 15m)
     'low_volume_threshold':{'type': 'float', 'low': 0.30, 'high': 0.70}, # Volume < X% of 7d avg = low liquidity
  #  'stop_cooldown_thresh':{'type': 'int',   'low': 2,    'high': 4},     # Stops to trigger de-scale (range too small; keep=2)
-    'leverage': {'type': 'float',  'low': 2.0,  'high': 100.0},
+  #  'leverage': {'type': 'float',  'low': 2.0,  'high': 100.0},
     # ─── Pruning ──────────────────────────────────────────────
     'deviance_sigma':   {'type': 'float', 'low': 2.5,  'high': 4.0},    # ETH-tuned: ETH is calmer, 3.0-3.5 is the sweet spot
     'gap_prune_mult':   {'type': 'float', 'low': 1.5,  'high': 4.0},    # Gap pruning threshold (tightened — aligns with narrower grid)
