@@ -94,7 +94,12 @@ LIVE_CONFIG = {
     'candle_close_grace_seconds': 5, # Wait after bar close for exchange to settle
 
     # Indicator Buffer
-    'buffer_size': 200,              # Rolling candle buffer (covers SMA(96) + headroom)
+    # GMM (use_ml_regime) requires n > actual_train_window where
+    # actual_train_window = max(500, min(2880, n//2)).
+    # For n=1500: actual_train_window = min(2880, 750) = 750 > 500 ✓
+    # and n(1500) > 750 ✓ → GMM trains on 750 bars, predicts on last 750.
+    # DO NOT lower below 1001 or GMM will permanently return NOISE.
+    'buffer_size': 1500,             # Rolling candle buffer — sized for GMM + all KAMA/ATR/ADX indicators
 
     # Order Management
     'order_sync_interval_seconds': 5,
