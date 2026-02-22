@@ -69,7 +69,7 @@ STRATEGY_PARAMS = {
     'fee_maker': 0.0002,            # 0.02% maker fee (Binance actual)
     'fee_taker': 0.0005,            # 0.05% taker fee (Binance actual)
     'slippage': 0.0005,             # 0.05% per side
-    'leverage': 12.0,                # 2x leverage (reduced from 3x — less stop-loss dollar impact)
+    'leverage': 4.0,                # 2x leverage (reduced from 3x — less stop-loss dollar impact)
     'allow_short': True,            # Enable short grid
 
     # ─── Risk De-scaling (new) ────────────────────────────────
